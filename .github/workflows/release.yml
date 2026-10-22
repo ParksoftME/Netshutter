@@ -1,0 +1,74 @@
+# vX.Y.Z 태그를 push하면 NetShutter.exe를 빌드해 GitHub 릴리스에 첨부한다.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      # 태그 버전(vX.Y.Z)을 netmeter.rc 버전 리소스에 넣는다. 앱 헤더·메뉴는 PRODUCTVERSION을 읽는다.
+      - name: Stamp version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') { throw "태그 형식이 vX.Y.Z가 아님: $tag" }
+          $comma = "$($Matches[1]),$($Matches[2]),$($Matches[3]),0"
+          $dot   = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
+          $rc = Get-Content src/netmeter.rc -Raw
+          $rc = $rc -replace 'FILEVERSION\s+[\d,]+', "FILEVERSION $comma"
+          $rc = $rc -replace 'PRODUCTVERSION\s+[\d,]+', "PRODUCTVERSION $comma"
+          $rc = $rc -replace '"FileVersion", "[^"]*"', "`"FileVersion`", `"$dot`""
+          $rc = $rc -replace '"ProductVersion", "[^"]*"', "`"ProductVersion`", `"$dot`""
+          Set-Content src/netmeter.rc $rc -NoNewline
+          Get-Content src/netmeter.rc
+
+      # 로컬과 같은 build.bat로 빌드한다 (옵션을 한곳에서만 관리).
+      - name: Build
+        shell: cmd
+        run: |
+          set PATH=${{ runner.temp }}\msys64\ucrt64\bin;%PATH%
+          g++ --version
+          call build.bat
+
+      - name: Release notes
+        shell: bash
+        run: |
+          tag='${{ github.ref_name }}'
+          prev=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)
+          range=${prev:+$prev..}$tag
+          sha=$(sha256sum NetShutter.exe | cut -d' ' -f1)
+          {
+            echo "## 바뀐 점"
+            git log --no-merges --pretty=format:'- %s' "$range"
+            echo
+            echo
+            echo "## SHA256"
+            echo '```'
+            echo "$sha  NetShutter.exe"
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' NetShutter.exe \
+            --title 'NetShutter ${{ github.ref_name }}' --notes-file notes.md

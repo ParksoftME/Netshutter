@@ -1,6 +1,12 @@
+# 빌드 결과물
 *.o
 *.res.o
 *.obj
-NetMeter.exe
+*.res
+*.exe
 /build/
-NetShutter.exe
+
+# 테스트용 하네스
+/harness/
+/tests/
+/test/

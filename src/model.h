@@ -31,53 +31,37 @@ inline bool IsStreamApp(const std::wstring& path) {
     return false;
 }
 
-// 전송(화면·영상·파일) 판정. 1초마다 실효 업로드(바이트/초)를 받아 켜짐/꺼짐을 돌려줌.
-// 평소 바닥(원격 데스크톱 대기 화면, 동기화 앱의 상시 신호 등)은 조용할 때 최근 10초 최솟값으로 잡아 뺌(최대 kFloorCap).
-// "흐르는 초" = 바닥을 뺀 업로드가 영상·화면급(kFlow) 이상인 초. 짧은 글·메시지는 어느 감도에서도 못 미침.
-//  보통: 최근 4초 중 3초 흐름 (2초 이상 지속, 화면 공유의 순간 끊김 1초 허용). 잡음 있으면 4초 연속
-//  둔감: 최근 6초 중 5초 흐름 (4초 이상 지속). 잡음 있으면 6초 연속
-//  민감: 보통 조건 + 최근 2초 업로드 합이 사진·파일 한 건 수준(kItem) 이상이면 바로
-// 해제는 감도와 무관하게 3초 연속 조용할 때(순간 하락에 깜빡이지 않게. 잡음 배경이면 그 3초 중 한 번 튀어도 해제).
-// 기준값은 실측(평소·원격 데스크톱 대기·글/사진/화면 공유 패턴)으로 정함.
+// 전송(화면·영상·파일) 판정: "최근 N초 평균 업로드"만 본다.
+//  켜짐: 평균 ≥ kOn,  꺼짐: 평균 < kOff (kOff < kOn 이라 경계에서 깜빡이지 않음)
+//  감도는 평균 내는 시간 N만 다름: 민감 2초, 보통 3초, 둔감 5초
+//  보통·둔감은 켜질 때 하나 더: 최근 W초 중 K초 이상이 켜짐 기준(kOn) 이상이어야 함.
+//   사진 한 장은 1~2초에 몰려 나가 평균은 높아도 이 조건을 못 채움. 화면 공유의 순간 끊김 1초는 허용.
+//   보통 4초 중 3초(2초 이상 계속), 둔감 6초 중 5초(4초 이상 계속). 민감은 평균만(사진 한 장도 잡음).
+//  위젯에 보이는 속도도 이 평균(avg)이라, 표시가 kOff보다 낮으면 항상 "외부 전송 없음".
+// 기준값(실측): 평소(아무것도 안 할 때) 2초 평균 최대 28KB/s, 480kbps 화면 공유 평균 약 62KB/s.
+//  켜짐 48KB/s(384kbps)는 그 사이, 꺼짐 24KB/s(192kbps)는 평소 중앙값(3~4KB/s)보다 충분히 위.
+// 입력 eff는 업로드 - 다운로드×5% (큰 다운로드에 딸려 나가는 ACK 3.5~3.9%를 뺌).
 struct UploadJudge {
-    static constexpr double kFlow = 40 * 1024;      // 320kbps (480kbps 화면 공유는 출렁여도 넘고, 평소 튐은 못 넘음)
-    static constexpr double kItem = 280 * 1024;     // 최근 2초 합 280KB (스크린샷·사진 한 장 ≥ 300KB)
-    static constexpr double kFloorCap = 32 * 1024;  // 바닥은 최대 256kbps까지만 인정
-    std::deque<double> hist;   // 최근 6초 (바닥 뺀 값)
-    std::deque<double> quiet;  // 꺼져 있을 때의 최근 30초 원래 값 (바닥·잡음 추정용)
+    static constexpr double kOn = 48 * 1024;
+    static constexpr double kOff = 24 * 1024;
+    std::deque<double> hist;  // 최근 6초
+    double avg = 0;           // 최근 N초 평균 (판정·표시 공통)
     bool on = false;
+    static size_t Window(int sens) { return sens == 2 ? 2 : sens == 1 ? 3 : 5; }
     bool Feed(double eff, int sens) {
-        if (eff < 0) eff = 0;
-        // 바닥 = 조용할 때 최근 10초 최솟값. 잡음 = 조용할 때 30초 안에 바닥 위로 kFlow 넘게 튄 일이 3번 이상
-        // (원격 데스크톱 대기 화면의 주기적 키프레임 등). 잡음이 있으면 연속 1초를 더 요구해 우연한 겹침을 거름.
-        double floor = 0;
-        int spikes = 0;  // 튄 횟수 (연속된 초는 한 번으로: 사진 한 건이 잡음으로 잡히지 않게)
-        if (!quiet.empty()) {
-            floor = std::min(*std::min_element(quiet.size() > 10 ? quiet.end() - 10 : quiet.begin(), quiet.end()), kFloorCap);
-            bool prevHi = false;  // 지금 판정 중인 최근 6초는 빼고 그 이전만 봄
-            for (size_t i = 0; i + 6 < quiet.size(); i++) {
-                bool hi = quiet[i] - floor >= kFlow;
-                spikes += hi && !prevHi;
-                prevHi = hi;
-            }
-        }
-        bool noisy = spikes >= 3;
-        if (!on) { quiet.push_back(eff); if (quiet.size() > 30) quiet.pop_front(); }
-        hist.push_back(std::max(0.0, eff - floor));
+        hist.push_back(eff > 0 ? eff : 0);
         if (hist.size() > 6) hist.pop_front();
-        auto flowSecs = [&](size_t win) {
-            int n = 0;
-            for (size_t i = hist.size() > win ? hist.size() - win : 0; i < hist.size(); i++) n += hist[i] >= kFlow;
-            return n;
-        };
-        int quietTail = 0;
-        for (auto it = hist.rbegin(); it != hist.rend() && *it < kFlow; ++it) quietTail++;
-        if (noisy && hist.size() >= 3 && flowSecs(3) <= 1) quietTail = 3;  // 잡음 배경: 3초 중 한 번 튀는 건 멈춘 것으로
-        if (!on) {
-            bool flow = sens == 0 ? flowSecs(6) >= (noisy ? 6 : 5) : flowSecs(4) >= (noisy ? 4 : 3);
-            double last2 = hist.back() + (hist.size() >= 2 ? hist[hist.size() - 2] : 0);
-            on = flow || (sens == 2 && last2 >= kItem);
-        } else if (quietTail >= 3) on = false;
+        size_t n = std::min(Window(sens), hist.size());
+        double sum = 0;
+        for (size_t i = hist.size() - n; i < hist.size(); i++) sum += hist[i];
+        avg = sum / n;
+        // 계속 올라가는 초 수: 보통 4초 중 3초, 둔감 6초 중 5초 (민감은 조건 없음)
+        size_t w = sens == 1 ? 4 : 6, k = sens == 1 ? 3 : 5;
+        size_t busy = 0;
+        for (size_t i = hist.size() > w ? hist.size() - w : 0; i < hist.size(); i++) busy += hist[i] >= kOn;
+        bool sustained = sens == 2 || busy >= k;
+        if (!on && avg >= kOn && sustained) on = true;
+        else if (on && avg < kOff) on = false;
         return on;
     }
 };
@@ -329,10 +313,11 @@ struct Model {
         }
 
         // 메인 UI용 통합 상태 갱신
-        stUp = totUp; stDown = totDown;
+        stDown = totDown;
         // 전송 판정: 앱 귀속과 무관하게 PC 전체 업로드로 본다(서비스·UDP 트래픽 포함).
         // 큰 다운로드에 딸려 나가는 ACK(실측 다운로드의 3.5~3.9%)는 5%를 빼서 제외.
         stUpBig = judge.Feed(totUp - 0.05 * totDown, sens);
+        stUp = judge.avg;  // 위젯 표시 속도 = 판정에 쓰는 평균
         etw.Flush();  // 이번 초의 이벤트를 다음 틱 전에 받도록
     }
 

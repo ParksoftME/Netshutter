@@ -35,6 +35,11 @@ static bool gCloseToTray = true; // X 누르면 트레이로(기본). 끄면 완
 static const wchar_t* kSiteUrl = L"https://kgnfgames.com";  // 홈페이지·후원 (임시로 둘 다 회사 사이트)
 static int gLang = 0;  // 0 = 한국어, 1 = English
 static const wchar_t* T(const wchar_t* ko, const wchar_t* en) { return gLang == 0 ? ko : en; }
+// 전송 감지 감도: 0 = 둔감, 1 = 보통(기본), 2 = 민감. 헤더 슬라이더로 고르고 저장.
+static int gSens = 1;
+static bool gSliding = false;          // 슬라이더 손잡이를 끄는 중 (위젯 이동 아님)
+static RectF gSlTrack;                 // 슬라이더 트랙 (창 좌표, 마지막 그린 위치)
+static float gSlKnobX = 0;             // 손잡이 중심 x (툴팁 위치)
 
 // 버전: exe에 들어 있는 버전 리소스(netmeter.rc의 PRODUCTVERSION)에서 읽어 "v주.부.수" 세 자리로.
 // 릴리스 때 rc 값만 바꾸면 화면에도 그대로 나옴. 읽기 실패 시 빈 문자열.
@@ -60,6 +65,38 @@ static const std::wstring& AppVersion() {
 }
 static POINT gDragStart{}, gWinStart{};
 static DWORD gFxStart = 0;      // 위치 알림 효과 시작 시각 (0 = 효과 없음)
+
+// 트레이 아이콘: 탐색기가 재시작하면 아이콘이 사라지므로 TaskbarCreated에 다시 등록,
+// 등록 실패(로그온 직후 작업표시줄 준비 전 등)는 타이머로 재시도.
+static UINT gMsgTaskbarCreated = 0;
+static bool gTrayOk = false;
+static const UINT kTrayTimer = 4;
+static const UINT WM_APP_REVEAL = WM_APP + 2;  // 두 번째 실행이 기존 위젯을 불러냄
+
+// 진단 로그: 시작·트레이·숨김·종료 같은 드문 사건만 %LOCALAPPDATA%\KGNF\NetShutter\netshutter.log 에 남김.
+// 화면에 아무것도 없이 프로세스만 남는 경우를 나중에 추적하기 위함. 64KB 넘으면 새로 씀.
+static void Log(const wchar_t* fmt, ...) {
+    static std::wstring path;
+    if (path.empty()) {
+        wchar_t base[MAX_PATH];
+        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH)) return;
+        std::wstring d = std::wstring(base) + L"\\KGNF";
+        CreateDirectoryW(d.c_str(), nullptr);
+        d += L"\\NetShutter";
+        CreateDirectoryW(d.c_str(), nullptr);
+        path = d + L"\\netshutter.log";
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    bool big = GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 64 * 1024;
+    FILE* f = _wfopen(path.c_str(), big ? L"w, ccs=UTF-8" : L"a, ccs=UTF-8");
+    if (!f) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    fwprintf(f, L"%04d-%02d-%02d %02d:%02d:%02d [%lu] ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+             GetCurrentProcessId());
+    va_list ap; va_start(ap, fmt); vfwprintf(f, fmt, ap); va_end(ap);
+    fputwc(L'\n', f);
+    fclose(f);
+}
 
 // 히트 영역 (줄/버튼 클릭 판정)
 struct Hit { RectF rc; int row; int btn; std::wstring key; };
@@ -331,6 +368,98 @@ static void StartLocateFx() {
     LocateFxFrame();
 }
 
+// 위젯을 화면 안에 보이게 + 맨 앞으로 + 위치 알림 (트레이 클릭, 두 번째 실행, 트레이 등록 실패 시)
+static void RevealWidget() {
+    EnsureOnScreen();
+    ShowWindow(gWnd, SW_SHOW);
+    SetWindowPos(gWnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(gWnd);
+    StartLocateFx();  // 부를 때마다 위치 알림 (연타 시 처음부터 다시)
+}
+
+static void TrayAdd() {
+    gTrayOk = Shell_NotifyIconW(NIM_ADD, &gTray) || Shell_NotifyIconW(NIM_MODIFY, &gTray);
+    if (gTrayOk) { KillTimer(gWnd, kTrayTimer); return; }
+    Log(L"tray add failed (err=%lu), retrying", GetLastError());
+    SetTimer(gWnd, kTrayTimer, 2000, nullptr);
+    if (!IsWindowVisible(gWnd)) RevealWidget();  // 아이콘도 창도 없는 상태로 두지 않음
+}
+
+// ── 감도 슬라이더 툴팁: 위젯 위쪽에 뜨는 작은 투명 창(클릭 통과). 내용·위치가 바뀔 때만 다시 그림 ──
+static HWND gTip = nullptr;
+static std::wstring gTipShown;
+static const wchar_t* SensDesc(int s) {
+    if (s == 2) return T(L"사진이나 파일을 보내면 알려요", L"Alerts when a photo or file is sent");
+    if (s == 0) return T(L"화면·영상이 오래 나갈 때만 알려요", L"Alerts only when screen or video goes out for a while");
+    return T(L"화면·영상이 나가면 알려요", L"Alerts when screen or video is going out");
+}
+static void HideSensTip() {
+    if (gTip) ShowWindow(gTip, SW_HIDE);
+    gTipShown.clear();
+}
+static void ShowSensTip() {
+    RECT wr; GetWindowRect(gWnd, &wr);
+    std::wstring text = SensDesc(gSens);
+    std::wstring key = text + L"|" + std::to_wstring(wr.left + (int)gSlKnobX) + L"," + std::to_wstring(wr.top);
+    if (key == gTipShown && gTip && IsWindowVisible(gTip)) return;
+    if (!gTip) {
+        static bool reg = false;
+        HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(gWnd, GWLP_HINSTANCE);
+        if (!reg) {
+            WNDCLASSW wc{}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = hi; wc.lpszClassName = L"KGNF_NetShutter_Tip";
+            reg = RegisterClassW(&wc) != 0;
+        }
+        gTip = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                               L"KGNF_NetShutter_Tip", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, hi, nullptr);
+        if (!gTip) return;
+        if (gHideCapture) SetWindowDisplayAffinity(gTip, WDA_EXCLUDEFROMCAPTURE);
+    }
+    FontFamily ff(L"Segoe UI");
+    Font f(&ff, 8.f * gDpi, FontStyleRegular, UnitPixel);
+    RectF tb;
+    { Bitmap probe(1, 1); Graphics pg(&probe); pg.MeasureString(text.c_str(), -1, &f, PointF(0, 0), &tb); }
+    int w = (int)tb.Width + Sx(10), h = (int)tb.Height + Sx(6);
+    BITMAPINFO bi{}; bi.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB};
+    void* bits = nullptr;
+    HDC sdc = GetDC(nullptr), mdc = CreateCompatibleDC(sdc);
+    HBITMAP bmp = CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) { DeleteDC(mdc); ReleaseDC(nullptr, sdc); return; }
+    HGDIOBJ old = SelectObject(mdc, bmp);
+    {
+        Bitmap bm(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Graphics gr(&bm);
+        gr.SetSmoothingMode(SmoothingModeAntiAlias);
+        gr.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        gr.Clear(Color(0, 0, 0, 0));
+        GraphicsPath p; RoundRect(p, RectF(0.5f, 0.5f, w - 1.f, h - 1.f), (float)Sx(4));
+        SolidBrush bg(Col(40, 40, 44, 250)); gr.FillPath(&bg, &p);
+        Pen pe(Col(255, 255, 255, 45), 1.f); gr.DrawPath(&pe, &p);
+        StringFormat sf; sf.SetAlignment(StringAlignmentCenter); sf.SetLineAlignment(StringAlignmentCenter);
+        SolidBrush fg(cFg);
+        gr.DrawString(text.c_str(), -1, &f, RectF(0, 0, (float)w, (float)h), &sf, &fg);
+    }
+    // 손잡이 위, 위젯 바깥 위쪽. 화면 위로 넘치면 위젯 아래쪽으로
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(gWnd, MONITOR_DEFAULTTONEAREST), &mi);
+    int x = wr.left + (int)gSlKnobX - w / 2, y = wr.top - h - Sx(3);
+    if (y < mi.rcWork.top) y = wr.bottom + Sx(3);
+    x = std::max((int)mi.rcWork.left, std::min(x, (int)mi.rcWork.right - w));
+    POINT dst{x, y}, src{0, 0};
+    SIZE sz{w, h};
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(gTip, sdc, &dst, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+    SelectObject(mdc, old); DeleteObject(bmp); DeleteDC(mdc); ReleaseDC(nullptr, sdc);
+    SetWindowPos(gTip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    gTipShown = key;
+}
+// 트랙 위 x → 가장 가까운 칸 (0 둔감 · 1 보통 · 2 민감)
+static void SetSensFromX(float x) {
+    float t = gSlTrack.Width > 0 ? (x - gSlTrack.X) / gSlTrack.Width : 0.5f;
+    int s = (int)lroundf(std::max(0.f, std::min(1.f, t)) * 2);
+    if (s != gSens) { gSens = s; g.sens = s; InvalidateRect(gWnd, nullptr, FALSE); UpdateWindow(gWnd); }
+    ShowSensTip();
+}
+
 // ── 렌더 ──
 static std::wstring FmtBytesRate(double bps) {  // 바이트/초 → "1.8 MB/s"
     wchar_t buf[32];
@@ -348,6 +477,35 @@ static std::wstring AppNames(bool mic) {  // 마이크/카메라 사용 중인 �
         s += a.name;
     }
     return s.empty() ? std::wstring(T(L"알 수 없는 앱", L"Unknown app")) : s;
+}
+
+// 업로드 출처 이름 (현재 언어). 실행파일 버전 정보 읽기는 출처·언어별로 한 번만.
+static std::wstring SourceLabel() {
+    if (g.srcKey.empty()) return T(L"출처 불분명", L"Unknown source");
+    if (g.srcKey == L"*win") return T(L"Windows 서비스", L"Windows services");
+    static std::map<std::wstring, std::wstring> cache;
+    std::wstring ck = std::to_wstring(gLang) + L"|" + g.srcKey;
+    auto it = cache.find(ck);
+    if (it != cache.end()) return it->second;
+    if (cache.size() > 64) cache.clear();
+    return cache[ck] = ProductLabel(g.srcKey, gLang == 0 ? 0x0412 : 0x0409);
+}
+// 업로드 출처 꼬리: "Discord" / "Discord 외 2"
+static std::wstring SourceTail(bool withMore) {
+    std::wstring s = SourceLabel();
+    if (withMore && g.srcMore > 0)
+        s += gLang == 0 ? L" 외 " + std::to_wstring(g.srcMore) : L" +" + std::to_wstring(g.srcMore);
+    return s;
+}
+// 후보 문구 중 폭 안에 들어가는 첫 번째 (모두 넘치면 마지막 것을 말줄임으로)
+static std::wstring FitFirst(Graphics& gr, const Font& f, float width, std::initializer_list<std::wstring> cands) {
+    std::wstring last;
+    for (auto& c : cands) {
+        RectF b; gr.MeasureString(c.c_str(), -1, &f, PointF(0, 0), &b);
+        if (b.Width <= width) return c;
+        last = c;
+    }
+    return last;
 }
 
 static void Paint() {
@@ -412,12 +570,50 @@ static void Paint() {
             DrawLogo(gr, Sx(7), (hh - Sx(11)) / 2.f, Sx(11));
             SolidBrush tb(cFg);
             gr.DrawString(L"NetShutter", -1, &fName, RectF((float)Sx(23), 0, (float)Sx(120), hh), &sfL, &tb);
+            RectF nb; gr.MeasureString(L"NetShutter", -1, &fName, PointF(0, 0), &nb);
+            float verEnd = Sx(23) + nb.Width;  // 슬라이더는 이 뒤부터 (버전 표시는 항상 유지)
             if (!AppVersion().empty()) {  // 이름 바로 옆 작은 회색 버전
-                RectF nb; gr.MeasureString(L"NetShutter", -1, &fName, PointF(0, 0), &nb);
                 SolidBrush vb(cDim);
                 gr.DrawString(AppVersion().c_str(), -1, &fSub, RectF(Sx(23) + nb.Width, 0, (float)Sx(60), hh), &sfL, &vb);
+                RectF vr; gr.MeasureString(AppVersion().c_str(), -1, &fSub, PointF(0, 0), &vr);
+                verEnd += vr.Width;
             }
             float cy = hh / 2.f, r2 = Sx(3.5f);
+            // 감도 슬라이더: 메뉴(⋯) 바로 왼쪽. "둔감 ━━●── 민감", 눈금 3칸. 좁으면 트랙만 줄임
+            {
+                Font fSl(&ff, 7.f * gDpi, FontStyleRegular, UnitPixel);
+                const wchar_t* lo = T(L"둔감", L"Low");
+                const wchar_t* hi = T(L"민감", L"High");
+                RectF lb, hb;
+                gr.MeasureString(lo, -1, &fSl, PointF(0, 0), &lb);
+                gr.MeasureString(hi, -1, &fSl, PointF(0, 0), &hb);
+                float right = (float)(W - Sx(31)) - Sx(11), left = verEnd + Sx(6), gap = (float)Sx(5);
+                float tw = std::min((float)Sx(38), right - left - lb.Width - hb.Width - gap * 2);
+                if (tw >= Sx(14)) {
+                    float x0 = right - hb.Width - gap - tw - gap - lb.Width;
+                    float tx = x0 + lb.Width + gap, th = Sx(2.5f), kd = Sx(5.f);
+                    SolidBrush lt(gHoverBtn == 5 || gSliding ? cFg : cDim);
+                    gr.DrawString(lo, -1, &fSl, RectF(x0, 0, lb.Width + 1, hh), &sfL, &lt);
+                    gr.DrawString(hi, -1, &fSl, RectF(tx + tw + gap, 0, hb.Width + 1, hh), &sfL, &lt);
+                    float kx = tx + tw * gSens / 2.f;
+                    GraphicsPath tr; RoundRect(tr, RectF(tx, cy - th / 2, tw, th), th / 2);
+                    SolidBrush gray(Col(255, 255, 255, 55)), org(Col(0xE8, 0x57, 0x2A));
+                    gr.FillPath(&gray, &tr);
+                    if (kx > tx) {
+                        GraphicsPath on; RoundRect(on, RectF(tx, cy - th / 2, kx - tx, th), th / 2);
+                        gr.FillPath(&org, &on);
+                    }
+                    SolidBrush tick(Col(255, 255, 255, 70));
+                    for (int i = 0; i < 3; i++) {  // 눈금: 트랙 아래 작은 점
+                        float ix = tx + tw * i / 2.f, d = Sx(1.2f);
+                        gr.FillEllipse(&tick, ix - d / 2, cy + th / 2 + Sx(1.5f), d, d);
+                    }
+                    gr.FillEllipse(&org, kx - kd / 2, cy - kd / 2, kd, kd);  // 손잡이: 주황 단색 원
+                    gSlTrack = RectF(tx, cy - th / 2, tw, th);
+                    gSlKnobX = kx;
+                    gHits.push_back({RectF(x0 - Sx(2), 0, right - x0 + Sx(4), hh), -1, 5, L""});
+                }
+            }
             // X (트레이로 숨김 또는 종료)
             float bx = (float)(W - Sx(13));
             Pen xp(gHoverBtn == 3 ? cFg : cDim, 1.3f * gDpi);
@@ -509,6 +705,8 @@ static void Paint() {
             SolidBrush tb(tc), sb(cDim);
             bool upOnly = video && !g.stCam;  // 전송 줄: 업로드를 멈출 수단이 없으므로 버튼 없음
             float tx = px + Sx(36), tw = (upOnly ? rightNoBtn : right) - tx;
+            if (upOnly)  // 업로드 속도 뒤에 출처. 길면 "외 N"부터 뺌
+                sub = FitFirst(gr, fSub, tw, {sub + L" · " + SourceTail(true), sub + L" · " + SourceTail(false)});
             if (sub.empty()) {
                 gr.DrawString(title.c_str(), -1, &fRow, RectF(tx, cy - Sx(10), tw, (float)Sx(20)), &sfL, &tb);
             } else {
@@ -532,6 +730,12 @@ static void Paint() {
                 else { ic = ICscreenUp; title = T(L"화면·영상·파일 전송 중", L"Screen/video/file upload"); aside = FmtBytesRate(g.stUp); }
                 Icon(gr, ic, px + Sx(10), cy - Sx(7), Sx(14), c, 1.6f);
                 bool upRow = isVideo && !g.stCam;  // 전송 줄은 버튼 없음
+                if (upRow) {  // 속도 뒤에 출처. 좁으면 "외 N" → 속도 순으로 빼고 앱 이름만
+                    RectF tb; gr.MeasureString(title.c_str(), -1, &fRow, PointF(0, 0), &tb);
+                    float room = rightNoBtn - (px + Sx(30)) - tb.Width - Sx(2);
+                    aside = FitFirst(gr, fSub, room, {aside + L" · " + SourceTail(true), aside + L" · " + SourceTail(false),
+                                                      SourceTail(false)});
+                }
                 titleWithAside(y, rh, title, aside, tc, upRow ? rightNoBtn : right);
                 if (isVideo && !upRow) { bool off = CameraIsBlocked(); button(cy, off ? T(L"해제", L"On") : T(L"끄기", L"Off"), c, 10, off); }
                 else if (!isVideo) button(cy, g.micMuted == 1 ? T(L"해제", L"Unmute") : T(L"음소거", L"Mute"), c, 11, g.micMuted == 1);
@@ -549,6 +753,7 @@ static void Paint() {
 
 // ── 우클릭 메뉴 ──
 static void ShowMenu() {
+    HideSensTip();
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, (L"NetShutter " + AppVersion()).c_str());  // 누를 수 없는 버전 줄
     AppendMenuW(m, MF_STRING, 7, L"NetShutter — kgnfgames.com");
@@ -576,6 +781,7 @@ static void ShowMenu() {
         gHideCapture = !gHideCapture;
         CfgSet(L"hideCapture", gHideCapture);
         SetWindowDisplayAffinity(gWnd, gHideCapture ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+        if (gTip) SetWindowDisplayAffinity(gTip, gHideCapture ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
         break;
     case 4: AutoStartSet(!AutoStartOn()); break;
     case 5: ShellExecuteW(nullptr, L"open", kSiteUrl, nullptr, nullptr, SW_SHOW); break;
@@ -614,6 +820,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 1) { g.Tick(h); Relayout(); InvalidateRect(h, nullptr, FALSE); }
         else if (wp == kFxTimer) LocateFxFrame();
+        else if (wp == kTrayTimer) TrayAdd();
         else if (wp == 2) {
             if (g.AnyLeak()) { gBlinkOn = !gBlinkOn; InvalidateRect(h, nullptr, FALSE); }
             else if (gBlinkOn) { gBlinkOn = false; InvalidateRect(h, nullptr, FALSE); }
@@ -621,6 +828,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); Paint(); EndPaint(h, &ps); return 0; }
     case WM_MOUSEMOVE: {
+        if (gSliding) { SetSensFromX((float)GET_X_LPARAM(lp)); return 0; }  // 감도 조절 중: 위젯은 그대로
         if (gDragging) {
             POINT pt; GetCursorPos(&pt);
             SetWindowPos(h, nullptr, gWinStart.x + (pt.x - gDragStart.x), gWinStart.y + (pt.y - gDragStart.y),
@@ -634,10 +842,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         int row, btn = HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), row);
         if (row != gHoverRow || btn != gHoverBtn) { gHoverRow = row; gHoverBtn = btn; InvalidateRect(h, nullptr, FALSE); }
+        if (btn == 5) { UpdateWindow(h); ShowSensTip(); }  // 슬라이더 위: 현재 단계 설명
+        else HideSensTip();
         TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0}; TrackMouseEvent(&tme);
         return 0;
     }
     case WM_MOUSELEAVE:
+        if (gSliding) return 0;  // 끄는 중에 창 밖으로 나가도 놓을 때까지 유지
+        HideSensTip();
         gHoverRow = -1; gHoverBtn = -1;
         if (gWinHover && !gDragging) {  // 창에서 벗어남 → 헤더 접고 톤 가라앉음
             gWinHover = false;
@@ -649,10 +861,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         int row, btn = HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), row);
         if (btn == 3) {  // X = 설정에 따라 트레이로 숨김 또는 완전 종료
-            if (gCloseToTray) { gWinHover = false; ShowWindow(h, SW_HIDE); Relayout(); }
-            else DestroyWindow(h);
+            if (gCloseToTray && !gTrayOk) TrayAdd();
+            if (gCloseToTray && gTrayOk) { HideSensTip(); gWinHover = false; ShowWindow(h, SW_HIDE); Relayout(); Log(L"hidden to tray"); }
+            else if (!gCloseToTray) DestroyWindow(h);
+            // 트레이 아이콘이 없으면 숨기지 않음: 다시 불러낼 방법이 없어짐
         } else if (btn == 4) {  // 헤더 메뉴 = 우클릭 메뉴
             ShowMenu();
+        } else if (btn == 5) {  // 감도 슬라이더: 누른 곳/끄는 곳에서 가장 가까운 칸으로
+            gSliding = true;
+            SetCapture(h);
+            SetSensFromX((float)GET_X_LPARAM(lp));
         } else if (btn == 10) {  // 영상 끄기 = 카메라 하드웨어 차단 토글 (인터넷 무관)
             CameraSetBlocked(!CameraIsBlocked());
             InvalidateRect(h, nullptr, FALSE);
@@ -669,6 +887,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP:
+        if (gSliding) {
+            gSliding = false;
+            ReleaseCapture();
+            CfgSet(L"sens", (DWORD)gSens);
+            POINT pt; GetCursorPos(&pt);
+            RECT wr; GetWindowRect(h, &wr);
+            if (!PtInRect(&wr, pt)) SendMessageW(h, WM_MOUSELEAVE, 0, 0);  // 창 밖에서 놓음 → 헤더 접기
+            return 0;
+        }
         if (gDragging) {
             gDragging = false;
             ReleaseCapture();
@@ -679,21 +906,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONUP: ShowMenu(); return 0;
     case WM_DISPLAYCHANGE: EnsureOnScreen(); return 0;
     case WM_APP + 1:  // 트레이 아이콘
-        if (LOWORD(lp) == WM_LBUTTONUP) {  // 항상 보이게 + 맨 앞으로 (숨기기는 X 버튼만)
-            EnsureOnScreen();
-            ShowWindow(h, SW_SHOW);
-            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            SetForegroundWindow(h);
-            StartLocateFx();  // 클릭할 때마다 위치 알림 (연타 시 처음부터 다시)
-        }
+        if (LOWORD(lp) == WM_LBUTTONUP) RevealWidget();  // 항상 보이게 + 맨 앞으로 (숨기기는 X 버튼만)
         else if (LOWORD(lp) == WM_RBUTTONUP) ShowMenu();
         return 0;
+    case WM_APP_REVEAL:  // 이미 실행 중일 때 다시 실행됨
+        Log(L"reveal requested by another launch");
+        if (!gTrayOk) TrayAdd();
+        RevealWidget();
+        return 0;
     case WM_DESTROY:
+        Log(L"exit");
+        Shell_NotifyIconW(NIM_DELETE, &gTray);  // 정리 중 멈춰도 아이콘이 남지 않게 먼저
         EndLocateFx();
         FwBlockRemove(L"");          // 남은 차단 규칙 청소
         g.etw.Stop();
-        Shell_NotifyIconW(NIM_DELETE, &gTray);
         PostQuitMessage(0);
+        return 0;
+    }
+    if (msg == gMsgTaskbarCreated && msg) {  // 탐색기 재시작 → 아이콘 다시 등록
+        Log(L"TaskbarCreated: re-adding tray icon");
+        gTrayOk = false;
+        TrayAdd();
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -713,18 +946,41 @@ static bool IsAdmin() {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // 단일 인스턴스
+    // 이미 실행 중이면 기존 위젯을 불러내고 끝냄. 기존 창이 아직 안 만들어졌거나(시작 중)
+    // 종료 중이면 최대 5초 기다려, 앞 인스턴스가 끝나면 이번 실행이 이어받음. 조용히 사라지지 않게.
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"KGNF_NetShutter_Single");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND prev = FindWindowW(L"KGNF_NetShutter", nullptr);
-        if (prev) { ShowWindow(prev, SW_SHOW); SetForegroundWindow(prev); }
-        return 0;
+        bool owned = false;
+        for (int i = 0; i < 50 && !owned; i++) {
+            HWND prev = FindWindowW(L"KGNF_NetShutter", nullptr);
+            if (prev) {
+                DWORD pid = 0; GetWindowThreadProcessId(prev, &pid);
+                AllowSetForegroundWindow(pid);  // 기존 인스턴스가 앞으로 나올 수 있게
+                PostMessageW(prev, WM_APP_REVEAL, 0, 0);
+                return 0;
+            }
+            DWORD w = WaitForSingleObject(mtx, 100);
+            owned = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
+        }
+        if (!owned) {
+            Log(L"another instance holds the mutex but has no window");
+            bool ko = CfgGet(L"lang", PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_KOREAN ? 0 : 1) == 0;
+            MessageBoxW(nullptr,
+                        ko ? L"NetShutter가 이미 실행 중이지만 응답하지 않습니다.\n작업 관리자에서 NetShutter를 종료한 뒤 다시 실행해 주세요."
+                           : L"NetShutter is already running but not responding.\nEnd NetShutter in Task Manager, then start it again.",
+                        L"NetShutter", MB_OK | MB_ICONWARNING);
+            return 0;
+        }
+        Log(L"previous instance ended; taking over");
     }
     // 관리자 아니면 승격 재실행
     if (!IsAdmin()) {
         wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         SHELLEXECUTEINFOW si{sizeof(si)};
         si.lpVerb = L"runas"; si.lpFile = exe; si.nShow = SW_NORMAL;
+        ReleaseMutex(mtx); CloseHandle(mtx);  // 승격본이 단일 인스턴스 검사에 걸리지 않게 먼저 놓음
         if (ShellExecuteExW(&si)) return 0;  // 승격본이 뜸
+        mtx = CreateMutexW(nullptr, TRUE, L"KGNF_NetShutter_Single");
         // 사용자가 UAC 거부 → 제한 모드로 계속 (앱별 특정·차단은 비활성)
     }
 
@@ -744,6 +1000,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         gLang = (int)CfgGet(L"lang", def);
     }
     gCloseToTray = CfgGet(L"closeToTray", 1) != 0;
+    gSens = (int)std::min<DWORD>(CfgGet(L"sens", 1), 2);
+    g.sens = gSens;
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
@@ -760,10 +1018,24 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     gWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                            L"KGNF_NetShutter", L"NetShutter", WS_POPUP,
                            x, y, WinW(), WinH(), nullptr, nullptr, hInst, nullptr);
+    if (!gWnd) {
+        Log(L"CreateWindow failed (err=%lu)", GetLastError());
+        MessageBoxW(nullptr, L"NetShutter could not create its window.", L"NetShutter", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    // 관리자 권한 창은 일반 권한 탐색기의 브로드캐스트를 못 받음(UIPI) → 명시적으로 허용
+    gMsgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    ChangeWindowMessageFilterEx(gWnd, gMsgTaskbarCreated, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(gWnd, WM_APP_REVEAL, MSGFLT_ALLOW, nullptr);
     SetLayeredWindowAttributes(gWnd, 0, 240, LWA_ALPHA);  // 전체 반투명
     gStartTick = GetTickCount();
     ShowWindow(gWnd, SW_SHOW);
     SetForegroundWindow(gWnd);  // 시작 시 위치가 보이게 앞으로
+    {
+        RECT r; GetWindowRect(gWnd, &r);
+        Log(L"start %ls admin=%d pos=%ld,%ld size=%ldx%ld visible=%d", AppVersion().c_str(), IsAdmin(),
+            r.left, r.top, r.right - r.left, r.bottom - r.top, IsWindowVisible(gWnd));
+    }
 
     // 트레이 아이콘
     gTray.cbSize = sizeof(gTray);
@@ -774,7 +1046,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     gTray.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                     GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     wcscpy(gTray.szTip, T(L"NetShutter — 유출 감시", L"NetShutter — what's leaving your PC"));
-    Shell_NotifyIconW(NIM_ADD, &gTray);
+    TrayAdd();
+    Log(L"tray icon %ls", gTrayOk ? L"added" : L"not added yet");
 
     g.Tick(gWnd);
     Relayout();
@@ -784,8 +1057,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    ReleaseMutex(mtx);  // 다음 실행이 바로 이어받을 수 있게 정리보다 먼저
+    CloseHandle(mtx);
     GdiplusShutdown(gGdip);
     CoUninitialize();
-    ReleaseMutex(mtx);
     return 0;
 }

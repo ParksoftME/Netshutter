@@ -13,6 +13,7 @@
 #include <vector>
 #include <set>
 #include <mutex>
+#include <atomic>
 #include <thread>
 #include <unordered_map>
 
@@ -146,6 +147,7 @@ struct EtwCounter {
     TRACEHANDLE session = 0;
     TRACEHANDLE trace = (TRACEHANDLE)INVALID_HANDLE_VALUE;
     std::thread worker;
+    std::atomic<bool> workerDone{true};
     bool running = false;
     std::mutex mu;
     std::unordered_map<DWORD, std::pair<unsigned long long, unsigned long long>> acc;  // pid -> up,down
@@ -179,6 +181,14 @@ struct EtwCounter {
         auto self = (EtwCounter*)r->UserContext;
         DWORD pid = *(const UINT32*)r->UserData;
         DWORD size = *((const UINT32*)r->UserData + 1);
+        // 같은 PC 안의 통신(루프백)은 밖으로 나가지 않으므로 앱별 집계에서 뺌. 페이로드 +8 = 목적지 주소
+        const BYTE* da = (const BYTE*)r->UserData + 8;
+        bool v6 = (id == 26 || id == 27 || id == 58 || id == 59);
+        if (!v6 && r->UserDataLength >= 12 && da[0] == 127) return;
+        if (v6 && r->UserDataLength >= 24) {
+            static const BYTE lo6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+            if (memcmp(da, lo6, 16) == 0) return;
+        }
         std::lock_guard<std::mutex> lk(self->mu);
         auto& a = self->acc[pid];
         if (send) a.first += size; else a.second += size;
@@ -213,7 +223,8 @@ struct EtwCounter {
             return false;
         }
         TRACEHANDLE t = trace;
-        worker = std::thread([t]() mutable { ProcessTrace(&t, 1, nullptr, nullptr); });
+        workerDone = false;
+        worker = std::thread([t, this]() mutable { ProcessTrace(&t, 1, nullptr, nullptr); workerDone = true; });
         running = true;
         return true;
     }
@@ -223,7 +234,9 @@ struct EtwCounter {
         FillProps(buf);
         ControlTraceW(session, EtwSessionName(), (EVENT_TRACE_PROPERTIES*)buf.data(), EVENT_TRACE_CONTROL_STOP);
         CloseTrace(trace);
-        if (worker.joinable()) worker.join();
+        // ProcessTrace가 돌아오지 않는 드문 경우에도 종료가 멈추지 않게 최대 3초만 기다림
+        for (int i = 0; i < 30 && !workerDone; i++) Sleep(100);
+        if (worker.joinable()) { if (workerDone) worker.join(); else worker.detach(); }
         session = 0;
         trace = (TRACEHANDLE)INVALID_HANDLE_VALUE;
         running = false;

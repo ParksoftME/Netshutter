@@ -15,6 +15,7 @@ struct ProcInfo {
     std::wstring path;   // 소문자 전체 경로 (앱 식별 키)
     DWORD session = 0;   // 0 = 서비스 세션
     std::wstring pkg;    // UWP 패키지 패밀리명 (있을 때만)
+    DWORD parent = 0;    // 부모 pid (업로드 출처를 창 있는 앱으로 묶을 때)
 };
 
 inline std::wstring PathOfPid(DWORD pid) {
@@ -60,6 +61,7 @@ inline void SnapshotProcs(std::unordered_map<DWORD, ProcInfo>& procs, bool wantP
             ProcessIdToSessionId(pid, &pi.session);
         }
         if (wantPkg && pi.pkg.empty() && pi.session != 0) pi.pkg = PkgOfPid(pid);
+        pi.parent = pe.th32ParentProcessID;
         next[pid] = pi;
     }
     CloseHandle(s);
@@ -142,6 +144,72 @@ inline std::wstring ScriptName(const std::wstring& cmd) {
     if (s != std::wstring::npos) r = r.substr(s + 1);
     if (r.size() > 20) r = r.substr(0, 19) + L"…";
     return r;
+}
+
+// exe 버전 정보의 문자열 하나. 원하는 언어(0x0412 한국어 / 0x0409 영어) 항목이 있으면 그것, 없으면 첫 항목.
+inline std::wstring VersionString(const std::wstring& path, const wchar_t* field, WORD lang) {
+    DWORD dummy = 0, sz = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    if (!sz) return L"";
+    std::vector<BYTE> v(sz);
+    if (!GetFileVersionInfoW(path.c_str(), 0, sz, v.data())) return L"";
+    struct LangCp { WORD l, c; } *tr = nullptr;
+    UINT n = 0;
+    if (!VerQueryValueW(v.data(), L"\\VarFileInfo\\Translation", (LPVOID*)&tr, &n) || n < sizeof(LangCp)) return L"";
+    UINT cnt = n / sizeof(LangCp), pick = 0;
+    for (UINT i = 0; i < cnt; i++) if (tr[i].l == lang) { pick = i; break; }
+    wchar_t q[128];
+    swprintf(q, 128, L"\\StringFileInfo\\%04x%04x\\%ls", tr[pick].l, tr[pick].c, field);
+    wchar_t* d = nullptr;
+    UINT dl = 0;
+    if (!VerQueryValueW(v.data(), q, (LPVOID*)&d, &dl) || !d || dl <= 1) return L"";
+    std::wstring s = d;
+    while (!s.empty() && iswspace(s.back())) s.pop_back();
+    return s;
+}
+
+// 업로드 출처 표시 이름: 제품 이름 → (윈도우 기본 프로그램이면) 파일 설명 → 실행파일 이름
+inline std::wstring ProductLabel(const std::wstring& path, WORD lang) {
+    std::wstring s = VersionString(path, L"ProductName", lang);
+    if (s.empty() || s.find(L"Operating System") != std::wstring::npos || s.find(L"운영 체제") != std::wstring::npos)
+        s = VersionString(path, L"FileDescription", lang);
+    if (s.empty()) {
+        s = FileStem(path);
+        if (!s.empty()) s[0] = towupper(s[0]);
+    }
+    if (s.size() > 28) s = s.substr(0, 27) + L"…";
+    return s;
+}
+
+// 윈도우 핵심 프로세스(서비스 호스트, System 등): 윈도우 폴더의 서비스 세션 프로세스와 서비스 호스트류
+inline bool IsWindowsCore(const std::wstring& path, DWORD session) {
+    if (path == L"system") return true;
+    if (path.find(L'\\') == std::wstring::npos) {  // 경로를 못 읽은 보호 프로세스: 이름으로
+        const wchar_t* core[] = {L"svchost.exe", L"registry", L"lsass.exe", L"services.exe", L"csrss.exe",
+                                 L"smss.exe", L"wininit.exe", L"memory compression", L"system"};
+        for (auto c : core) if (path == c) return true;
+        return false;
+    }
+    static std::wstring win;
+    if (win.empty()) {
+        wchar_t b[MAX_PATH];
+        win = GetWindowsDirectoryW(b, MAX_PATH) ? Lower(b) + L"\\" : L"c:\\windows\\";
+    }
+    if (path.compare(0, win.size(), win) != 0) return false;
+    if (session == 0) return true;
+    std::wstring st = Lower(FileStem(path));
+    const wchar_t* hosts[] = {L"svchost", L"taskhostw", L"backgroundtaskhost", L"runtimebroker", L"dllhost", L"wudfhost"};
+    for (auto h : hosts) if (st == h) return true;
+    return false;
+}
+
+// 부모를 거슬러 올라가다 멈출 곳: 셸·터미널·탐색기·서비스 관리자 (그 아래 프로그램은 각자 출처)
+inline bool IsLauncherShell(const std::wstring& path) {
+    std::wstring st = Lower(FileStem(path));
+    const wchar_t* s[] = {L"explorer", L"cmd", L"powershell", L"pwsh", L"windowsterminal", L"conhost", L"openconsole",
+                          L"bash", L"sh", L"mintty", L"wsl", L"wslhost", L"services", L"svchost", L"wininit",
+                          L"userinit", L"sihost", L"taskeng", L"taskhostw", L"code", L"devenv", L"claude"};
+    for (auto x : s) if (st == x) return true;
+    return false;
 }
 
 // exe의 FileDescription을 사람이 읽을 이름으로 (없으면 파일명)

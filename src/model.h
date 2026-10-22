@@ -44,6 +44,57 @@ inline bool IsStreamApp(const std::wstring& path) {
     return false;
 }
 
+// 전송(화면·영상·파일) 판정. 1초마다 실효 업로드(바이트/초)를 받아 켜짐/꺼짐을 돌려줌.
+// 평소 바닥(원격 데스크톱 대기 화면, 동기화 앱의 상시 신호 등)은 조용할 때 최근 10초 최솟값으로 잡아 뺌(최대 kFloorCap).
+// "흐르는 초" = 바닥을 뺀 업로드가 영상·화면급(kFlow) 이상인 초. 짧은 글·메시지는 어느 감도에서도 못 미침.
+//  보통: 최근 4초 중 3초 흐름 (2초 이상 지속, 화면 공유의 순간 끊김 1초 허용). 잡음 있으면 4초 연속
+//  둔감: 최근 6초 중 5초 흐름 (4초 이상 지속). 잡음 있으면 6초 연속
+//  민감: 보통 조건 + 최근 2초 업로드 합이 사진·파일 한 건 수준(kItem) 이상이면 바로
+// 해제는 감도와 무관하게 3초 연속 조용할 때(순간 하락에 깜빡이지 않게. 잡음 배경이면 그 3초 중 한 번 튀어도 해제).
+// 기준값은 실측(평소·원격 데스크톱 대기·글/사진/화면 공유 패턴)으로 정함.
+struct UploadJudge {
+    static constexpr double kFlow = 40 * 1024;      // 320kbps (480kbps 화면 공유는 출렁여도 넘고, 평소 튐은 못 넘음)
+    static constexpr double kItem = 280 * 1024;     // 최근 2초 합 280KB (스크린샷·사진 한 장 ≥ 300KB)
+    static constexpr double kFloorCap = 32 * 1024;  // 바닥은 최대 256kbps까지만 인정
+    std::deque<double> hist;   // 최근 6초 (바닥 뺀 값)
+    std::deque<double> quiet;  // 꺼져 있을 때의 최근 30초 원래 값 (바닥·잡음 추정용)
+    bool on = false;
+    bool Feed(double eff, int sens) {
+        if (eff < 0) eff = 0;
+        // 바닥 = 조용할 때 최근 10초 최솟값. 잡음 = 조용할 때 30초 안에 바닥 위로 kFlow 넘게 튄 일이 3번 이상
+        // (원격 데스크톱 대기 화면의 주기적 키프레임 등). 잡음이 있으면 연속 1초를 더 요구해 우연한 겹침을 거름.
+        double floor = 0;
+        int spikes = 0;  // 튄 횟수 (연속된 초는 한 번으로: 사진 한 건이 잡음으로 잡히지 않게)
+        if (!quiet.empty()) {
+            floor = std::min(*std::min_element(quiet.size() > 10 ? quiet.end() - 10 : quiet.begin(), quiet.end()), kFloorCap);
+            bool prevHi = false;  // 지금 판정 중인 최근 6초는 빼고 그 이전만 봄
+            for (size_t i = 0; i + 6 < quiet.size(); i++) {
+                bool hi = quiet[i] - floor >= kFlow;
+                spikes += hi && !prevHi;
+                prevHi = hi;
+            }
+        }
+        bool noisy = spikes >= 3;
+        if (!on) { quiet.push_back(eff); if (quiet.size() > 30) quiet.pop_front(); }
+        hist.push_back(std::max(0.0, eff - floor));
+        if (hist.size() > 6) hist.pop_front();
+        auto flowSecs = [&](size_t win) {
+            int n = 0;
+            for (size_t i = hist.size() > win ? hist.size() - win : 0; i < hist.size(); i++) n += hist[i] >= kFlow;
+            return n;
+        };
+        int quietTail = 0;
+        for (auto it = hist.rbegin(); it != hist.rend() && *it < kFlow; ++it) quietTail++;
+        if (noisy && hist.size() >= 3 && flowSecs(3) <= 1) quietTail = 3;  // 잡음 배경: 3초 중 한 번 튀는 건 멈춘 것으로
+        if (!on) {
+            bool flow = sens == 0 ? flowSecs(6) >= (noisy ? 6 : 5) : flowSecs(4) >= (noisy ? 4 : 3);
+            double last2 = hist.back() + (hist.size() >= 2 ? hist[hist.size() - 2] : 0);
+            on = flow || (sens == 2 && last2 >= kItem);
+        } else if (quietTail >= 3) on = false;
+        return on;
+    }
+};
+
 struct Model {
     std::map<std::wstring, App> apps;
     std::unordered_map<DWORD, ProcInfo> procs;
@@ -55,7 +106,12 @@ struct Model {
     // 메인 UI용 통합 상태: 유출 중이냐 / 외부 전송 없음이냐
     bool stMic = false, stCam = false, stUpBig = false;
     double stUp = 0, stDown = 0;
-    std::deque<double> upHist;  // 최근 4초 실효 업로드(바이트/초)
+    UploadJudge judge;
+    int sens = 1;               // 전송 감지 감도: 0 둔감, 1 보통, 2 민감
+    // 업로드 출처: 가장 많이 올리는 곳 하나 + 그 외 개수. 키 = 실행파일 경로, L"*win" = 윈도우 서비스, L"" = 불분명
+    std::wstring srcKey;
+    int srcMore = 0;
+    std::map<std::wstring, double> srcEma;  // 출처별 평활 업로드(바이트/초)
     bool AudioLeak() const { return stMic; }                 // 마이크 사용 = 음성 송출 (확실)
     bool VideoLeak() const { return stCam || stUpBig; }      // 카메라(확실) 또는 영상급 업로드(화면 추정)
     bool AnyLeak() const { return AudioLeak() || VideoLeak(); }
@@ -71,6 +127,46 @@ struct Model {
         }
         return a;
     }
+    // 업로드한 pid의 출처: 작업표시줄에 창이 있는 앱 소속(보조·자식 프로세스 포함)이면 그 앱,
+    // 윈도우 핵심 프로세스면 "*win", 그 외에는 실행파일 자신. 프로세스를 모르면 "" (불분명).
+    std::wstring SourceKeyOf(DWORD pid, const std::set<DWORD>& winPids, const std::set<std::wstring>& winKeys) {
+        auto it = procs.find(pid);
+        if (it == procs.end() || pid == 0) return L"";
+        if (IsWindowsCore(it->second.path, it->second.session)) return L"*win";
+        if (it->second.path.find(L'\\') == std::wstring::npos) return L"";  // 경로를 못 읽은 프로세스
+        // 부모를 따라 올라가며 창 있는 앱을 찾음. 창이 없으면(트레이 앱) 셸·탐색기 바로 아래의 최상위 프로세스.
+        DWORD cur = pid;
+        std::wstring root = it->second.path;
+        for (int depth = 0; depth < 8; depth++) {
+            auto c = procs.find(cur);
+            if (c == procs.end()) break;
+            if (winPids.count(cur) || winKeys.count(c->second.path)) return c->second.path;
+            if (c->second.path.find(L'\\') != std::wstring::npos && !IsWindowsCore(c->second.path, c->second.session))
+                root = c->second.path;
+            DWORD par = c->second.parent;
+            auto p = procs.find(par);
+            if (p == procs.end() || par == cur || p->second.session != c->second.session ||
+                IsLauncherShell(p->second.path)) break;
+            cur = par;
+        }
+        if (root != it->second.path) return root;
+        // 부모가 이미 끝난 보조 프로세스: 같은 설치 폴더(또는 그 상위)에서 창이 있거나 셸·탐색기가 직접 띄운
+        // 본체 앱이 실행 중이면 그 앱 소속. "C:\Program Files\" 같은 공용 폴더(깊이 2 이하)는 묶지 않음.
+        std::wstring dir = root.substr(0, root.find_last_of(L'\\') + 1), best;
+        size_t bestLen = 0;
+        for (auto& kv : procs) {
+            const std::wstring& p = kv.second.path;
+            if (p == root || kv.second.session != it->second.session || p.find(L'\\') == std::wstring::npos) continue;
+            std::wstring d = p.substr(0, p.find_last_of(L'\\') + 1);
+            if (std::count(d.begin(), d.end(), L'\\') < 3 || dir.compare(0, d.size(), d) != 0) continue;
+            if (IsWindowsCore(p, kv.second.session) || IsLauncherShell(p)) continue;
+            auto par = procs.find(kv.second.parent);
+            bool main = winPids.count(kv.first) || par == procs.end() || IsLauncherShell(par->second.path);
+            if (main && (best.empty() || d.size() < bestLen)) { best = p; bestLen = d.size(); }
+        }
+        return best.empty() ? root : best;
+    }
+
     std::vector<App*> Rows() {
         std::vector<App*> v;
         for (auto& kv : apps) if (kv.second.listed) v.push_back(&kv.second);
@@ -167,6 +263,34 @@ struct Model {
             if (unattr >= 64 * 1024) { rate[L"__unknown__"].first = unattr; Get(L"__unknown__"); }
         }
 
+        // 업로드 출처: ETW로 실제 송신이 확인된 프로세스만 출처별로 묶음. 전체 업로드 중 어느 프로세스에도
+        // 귀속되지 않은 몫(헤더·ACK 몫 제외)은 "불분명". 순간 출렁임에 이름이 바뀌지 않게 몇 초 평활.
+        {
+            std::map<std::wstring, double> cur;
+            double attributed = 0;
+            for (auto& kv : raw) {
+                double up = kv.second.first / dt;
+                if (up <= 0) continue;
+                attributed += up;
+                cur[SourceKeyOf(kv.first, winPids, winKeys)] += up;
+            }
+            double rest = totUp - attributed * 1.06 - 0.05 * totDown;
+            if (rest > 0) cur[L""] += rest;
+            for (auto& kv : srcEma) kv.second *= 0.4;
+            for (auto& kv : cur) srcEma[kv.first] += 0.6 * kv.second;
+            double top = 0;
+            srcKey.clear();
+            for (auto it = srcEma.begin(); it != srcEma.end();) {
+                if (it->second < 512) { it = srcEma.erase(it); continue; }
+                if (it->second > top) { top = it->second; srcKey = it->first; }
+                ++it;
+            }
+            if (top < 8 * 1024) srcKey.clear();  // 확인된 업로드가 거의 없으면 이름을 띄우지 않음
+            srcMore = 0;
+            for (auto& kv : srcEma)
+                if (kv.first != srcKey && kv.second >= std::max(20.0 * 1024, 0.15 * top)) srcMore++;
+        }
+
         for (auto it = apps.begin(); it != apps.end();) {
             App& a = it->second;
             auto r = rate.find(a.key);
@@ -215,18 +339,7 @@ struct Model {
         stUp = totUp; stDown = totDown;
         // 전송 판정: 앱 귀속과 무관하게 PC 전체 업로드로 본다(서비스·UDP 트래픽 포함).
         // 큰 다운로드에 딸려 나가는 ACK(실측 다운로드의 3.5~3.9%)는 5%를 빼서 제외.
-        // 화면 공유는 비트레이트가 출렁이므로 "최근 4초 중 3초 이상 활동 + 평균"으로 켜고,
-        // 3초 연속 조용해야 끔(짧은 튐에 켜지지 않고, 순간 하락에 깜빡이지 않게).
-        const double kActive = 20 * 1024, kEnterAvg = 32 * 1024;  // 160kbps / 256kbps
-        double eff = totUp - 0.05 * totDown;
-        upHist.push_back(eff > 0 ? eff : 0);
-        if (upHist.size() > 4) upHist.pop_front();
-        int upSecs = 0, quietTail = 0;
-        double sum = 0;
-        for (double v : upHist) { sum += v; if (v >= kActive) upSecs++; }
-        for (auto it = upHist.rbegin(); it != upHist.rend() && *it < kActive; ++it) quietTail++;
-        if (!stUpBig) stUpBig = upHist.size() >= 3 && upSecs >= 3 && sum / upHist.size() >= kEnterAvg;
-        else if (quietTail >= 3) stUpBig = false;
+        stUpBig = judge.Feed(totUp - 0.05 * totDown, sens);
     }
 
     void ToggleBlock(App& a) {

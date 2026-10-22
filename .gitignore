@@ -1,0 +1,6 @@
+*.o
+*.res.o
+*.obj
+NetMeter.exe
+/build/
+NetShutter.exe

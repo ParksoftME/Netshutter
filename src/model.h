@@ -100,6 +100,7 @@ struct Model {
     std::map<std::wstring, double> srcEma;  // 출처별 평활 업로드(바이트/초)
     double prevTot = 0, prevAttr = 0, prevDown = 0;  // 직전 틱 (ETW 지연 보정용)
     int etwTicks = 0;                                // ETW가 켜진 뒤 지난 틱 수
+    int etwRestarts = 0;                             // 바깥에서 멈춘 ETW 세션을 다시 켠 횟수 (진단 로그용)
     std::wstring srcDiag;                            // 진단 로그용 최근 출처 계산 요약
     bool AnyLeak() const { return stUpBig; }  // 영상급 업로드(화면·영상·파일 전송 추정)
 
@@ -190,6 +191,9 @@ struct Model {
         // 활동 게이트: 조용하면 ETW를 꺼서 유휴 시 부하 0
         bool active = totUp >= 6 * 1024 || totDown >= 200 * 1024 || anyBlocked;
         if (active) lastActive = tick;
+        // ETW 세션이 바깥에서 멈춰졌으면(다른 프로그램이 같은 이름 세션을 정지, logman stop 등) 받는 스레드가 끝나 있음
+        // → 정리하고 아래에서 다시 시작. 안 그러면 앱별 집계가 끊긴 채 출처가 계속 "불분명"이 됨.
+        if (etw.running && etw.workerDone) { etw.Stop(); etwRestarts++; }
         if (active && !etw.running) etw.Start();
         else if (!active && etw.running && tick - lastActive > 60) etw.Stop();
 

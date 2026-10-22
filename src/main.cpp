@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <dwmapi.h>
 #include <objbase.h>
 #include <gdiplus.h>
@@ -368,9 +369,55 @@ static void RevealWidget() {
     StartLocateFx();  // 부를 때마다 위치 알림 (연타 시 처음부터 다시)
 }
 
+// 트레이 아이콘을 작업표시줄에 항상 보이게: 윈도우 11은 새 앱(새 경로·새 버전)의 아이콘을 ^ 숨김 영역에 넣고,
+// 사용자 설정을 HKCU\Control Panel\NotifyIconSettings\<id>\IsPromoted 에 둔다. 우리 항목에 값이 아직 없을 때만
+// 1로 켬(사용자가 윈도우 설정에서 직접 끈 경우 = 값 0은 그대로 존중). 항목은 아이콘 등록 직후 생기므로 몇 초간 재시도.
+static const UINT kPromoteTimer = 5;
+static int gPromoteTries = 0;
+static std::wstring ResolveTrayPath(const std::wstring& p) {  // "{알려진 폴더 GUID}\나머지" 형식을 실제 경로로
+    if (p.size() < 39 || p[0] != L'{') return p;
+    GUID id;
+    if (FAILED(CLSIDFromString(p.substr(0, 38).c_str(), &id))) return p;
+    PWSTR base = nullptr;
+    std::wstring r = p;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &base))) r = std::wstring(base) + p.substr(38);
+    CoTaskMemFree(base);
+    return r;
+}
+static bool PromoteTrayIcon() {  // 처리 끝(켰거나, 이미 값이 있음)이면 true
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    HKEY root;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\NotifyIconSettings", 0, KEY_READ, &root) != ERROR_SUCCESS) return false;
+    bool done = false;
+    wchar_t sub[64];
+    for (DWORD i = 0; !done; i++) {
+        DWORD n = 64;
+        if (RegEnumKeyExW(root, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        wchar_t path[MAX_PATH * 2]; DWORD sz = sizeof(path);
+        if (RegGetValueW(root, sub, L"ExecutablePath", RRF_RT_REG_SZ, nullptr, path, &sz) != ERROR_SUCCESS) continue;
+        if (_wcsicmp(ResolveTrayPath(path).c_str(), exe) != 0) continue;
+        DWORD v = 0; sz = sizeof(v);
+        if (RegGetValueW(root, sub, L"IsPromoted", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) { done = true; break; }
+        HKEY k;
+        if (RegOpenKeyExW(root, sub, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+            v = 1;
+            done = RegSetValueExW(k, L"IsPromoted", 0, REG_DWORD, (const BYTE*)&v, sizeof(v)) == ERROR_SUCCESS;
+            RegCloseKey(k);
+            if (done) Log(L"tray icon set to always show (Windows tray setting was unset)");
+        }
+    }
+    RegCloseKey(root);
+    return done;
+}
+
 static void TrayAdd() {
     gTrayOk = Shell_NotifyIconW(NIM_ADD, &gTray) || Shell_NotifyIconW(NIM_MODIFY, &gTray);
-    if (gTrayOk) { KillTimer(gWnd, kTrayTimer); return; }
+    if (gTrayOk) {
+        KillTimer(gWnd, kTrayTimer);
+        gPromoteTries = 0;
+        if (!PromoteTrayIcon()) SetTimer(gWnd, kPromoteTimer, 1000, nullptr);
+        return;
+    }
     Log(L"tray add failed (err=%lu), retrying", GetLastError());
     SetTimer(gWnd, kTrayTimer, 2000, nullptr);
     if (!IsWindowVisible(gWnd)) RevealWidget();  // 아이콘도 창도 없는 상태로 두지 않음
@@ -728,6 +775,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             unknownTicks = (g.stUpBig && g.srcKey.empty()) ? unknownTicks + 1 : 0;
             if ((g.stUpBig && !wasUp) || (unknownTicks && unknownTicks % 30 == 0))
                 Log(L"upload on, source=%ls: %ls", g.srcKey.empty() ? L"(unknown)" : g.srcKey.c_str(), g.srcDiag.c_str());
+            static int loggedRestarts = 0;
+            if (g.etwRestarts != loggedRestarts) Log(L"ETW session was stopped from outside; restarted (count=%d)", g.etwRestarts);
+            loggedRestarts = g.etwRestarts;
             static DWORD loggedErr = 0;
             if (g.etw.lastErr && g.etw.lastErr != loggedErr) Log(L"ETW start failed (err=%lu)", g.etw.lastErr);
             loggedErr = g.etw.lastErr;
@@ -735,6 +785,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (wp == kFxTimer) LocateFxFrame();
         else if (wp == kTrayTimer) TrayAdd();
+        else if (wp == kPromoteTimer) { if (PromoteTrayIcon() || ++gPromoteTries >= 15) KillTimer(h, kPromoteTimer); }
         else if (wp == 2) {
             if (g.AnyLeak()) { gBlinkOn = !gBlinkOn; InvalidateRect(h, nullptr, FALSE); }
             else if (gBlinkOn) { gBlinkOn = false; InvalidateRect(h, nullptr, FALSE); }

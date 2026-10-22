@@ -52,10 +52,10 @@ struct Model {
     DWORD lastMs = 0;
     int tick = 0, lastActive = -1000;
     int micMuted = -1;
-    // 메인 UI용 통합 상태: 유출 중이냐 / 안전하냐
+    // 메인 UI용 통합 상태: 유출 중이냐 / 외부 전송 없음이냐
     bool stMic = false, stCam = false, stUpBig = false;
     double stUp = 0, stDown = 0;
-    int upBigRun = 0;
+    std::deque<double> upHist;  // 최근 4초 실효 업로드(바이트/초)
     bool AudioLeak() const { return stMic; }                 // 마이크 사용 = 음성 송출 (확실)
     bool VideoLeak() const { return stCam || stUpBig; }      // 카메라(확실) 또는 영상급 업로드(화면 추정)
     bool AnyLeak() const { return AudioLeak() || VideoLeak(); }
@@ -100,6 +100,7 @@ struct Model {
         std::set<std::wstring> micP, micK, camP, camK;
         ReadConsent(HKEY_CURRENT_USER, L"microphone", micP, micK);
         ReadConsent(HKEY_LOCAL_MACHINE, L"microphone", micP, micK);
+        MicCapturePaths(micP);  // 기록이 안 남는 빌드 대비: 실제 녹음 세션
         ReadConsent(HKEY_CURRENT_USER, L"webcam", camP, camK);
         ReadConsent(HKEY_LOCAL_MACHINE, L"webcam", camP, camK);
         micMuted = MicMuteState();
@@ -212,8 +213,20 @@ struct Model {
         stMic = !micKeys.empty();
         stCam = !camKeys.empty();
         stUp = totUp; stDown = totDown;
-        upBigRun = (totUp >= 100 * 1024) ? upBigRun + 1 : 0;   // ~800kbps↑ 지속 = 영상급
-        stUpBig = (upBigRun >= 2) || (stUpBig && totUp >= 60 * 1024);
+        // 전송 판정: 앱 귀속과 무관하게 PC 전체 업로드로 본다(서비스·UDP 트래픽 포함).
+        // 큰 다운로드에 딸려 나가는 ACK(실측 다운로드의 3.5~3.9%)는 5%를 빼서 제외.
+        // 화면 공유는 비트레이트가 출렁이므로 "최근 4초 중 3초 이상 활동 + 평균"으로 켜고,
+        // 3초 연속 조용해야 끔(짧은 튐에 켜지지 않고, 순간 하락에 깜빡이지 않게).
+        const double kActive = 20 * 1024, kEnterAvg = 32 * 1024;  // 160kbps / 256kbps
+        double eff = totUp - 0.05 * totDown;
+        upHist.push_back(eff > 0 ? eff : 0);
+        if (upHist.size() > 4) upHist.pop_front();
+        int upSecs = 0, quietTail = 0;
+        double sum = 0;
+        for (double v : upHist) { sum += v; if (v >= kActive) upSecs++; }
+        for (auto it = upHist.rbegin(); it != upHist.rend() && *it < kActive; ++it) quietTail++;
+        if (!stUpBig) stUpBig = upHist.size() >= 3 && upSecs >= 3 && sum / upHist.size() >= kEnterAvg;
+        else if (quietTail >= 3) stUpBig = false;
     }
 
     void ToggleBlock(App& a) {

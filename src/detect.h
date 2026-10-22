@@ -8,6 +8,8 @@
 #include <evntcons.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 #include <vector>
 #include <set>
 #include <mutex>
@@ -51,6 +53,69 @@ inline void ReadConsent(HKEY root, const wchar_t* cap, std::set<std::wstring>& p
         }
     }
     RegCloseKey(h);
+}
+
+// ── 마이크: 녹음 장치의 활성 오디오 세션 (WASAPI) ──
+// 25H2 이후 ConsentStore의 LastUsedTime 기록이 갱신되지 않는 빌드가 있어, 지금 실제로
+// 녹음 스트림을 돌리는 프로세스를 오디오 엔진에서 직접 읽는다. 패키지/일반 앱 구분 없음.
+// 장치별 세션 관리자는 캐시하고 5초마다(또는 실패 시) 장치 목록을 다시 읽어 호출 비용을 줄임.
+struct MicSessionCache {
+    std::vector<IAudioSessionManager2*> mgrs;
+    DWORD lastEnum = 0;
+    bool valid = false;
+    void Clear() { for (auto m : mgrs) m->Release(); mgrs.clear(); valid = false; }
+    void Refresh() {
+        Clear();
+        lastEnum = GetTickCount();
+        IMMDeviceEnumerator* en = nullptr;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                    __uuidof(IMMDeviceEnumerator), (void**)&en))) return;
+        IMMDeviceCollection* col = nullptr;
+        if (SUCCEEDED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &col))) {
+            UINT n = 0;
+            col->GetCount(&n);
+            for (UINT i = 0; i < n; i++) {
+                IMMDevice* d = nullptr;
+                if (FAILED(col->Item(i, &d))) continue;
+                IAudioSessionManager2* mgr = nullptr;
+                if (SUCCEEDED(d->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)))
+                    mgrs.push_back(mgr);
+                d->Release();
+            }
+            col->Release();
+        }
+        en->Release();
+        valid = true;
+    }
+};
+inline void MicCapturePaths(std::set<std::wstring>& paths) {
+    static MicSessionCache cache;
+    if (!cache.valid || GetTickCount() - cache.lastEnum >= 5000) cache.Refresh();
+    bool failed = false;
+    for (auto mgr : cache.mgrs) {
+        IAudioSessionEnumerator* se = nullptr;
+        if (FAILED(mgr->GetSessionEnumerator(&se))) { failed = true; continue; }  // 장치 분리 등
+        int cnt = 0;
+        se->GetCount(&cnt);
+        for (int k = 0; k < cnt; k++) {
+            IAudioSessionControl* sc = nullptr;
+            if (FAILED(se->GetSession(k, &sc))) continue;
+            AudioSessionState st = AudioSessionStateInactive;
+            IAudioSessionControl2* sc2 = nullptr;
+            if (SUCCEEDED(sc->GetState(&st)) && st == AudioSessionStateActive &&
+                SUCCEEDED(sc->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&sc2))) {
+                DWORD pid = 0;
+                if (SUCCEEDED(sc2->GetProcessId(&pid)) && pid && pid != GetCurrentProcessId()) {
+                    std::wstring p = PathOfPid(pid);
+                    if (!p.empty()) paths.insert(p);
+                }
+                sc2->Release();
+            }
+            sc->Release();
+        }
+        se->Release();
+    }
+    if (failed) cache.valid = false;  // 다음 틱에 장치 목록 다시 읽기
 }
 
 // ── 전체 인터페이스 누적 바이트 (활동 게이트 + 폴백 표시용) ──

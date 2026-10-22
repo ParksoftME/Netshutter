@@ -135,6 +135,44 @@ inline bool TotalOctets(unsigned long long& in, unsigned long long& out) {
     return true;
 }
 
+// ── PID 없이 들어온 송신을 소켓 표(로컬 포트 → 소유 프로세스)로 주인 찾기 ──
+// 키: 0x20000 = UDP, 0x10000 = IPv6, 하위 16비트 = 로컬 포트(네트워크 순서). 못 찾은 양은 unresolved로.
+inline void ResolvePorts(const std::unordered_map<DWORD, unsigned long long>& ports,
+                         std::unordered_map<DWORD, std::pair<unsigned long long, unsigned long long>>& raw,
+                         unsigned long long& unresolved) {
+    if (ports.empty()) return;
+    bool wantTcp = false, wantUdp = false;
+    for (auto& kv : ports) (kv.first & 0x20000 ? wantUdp : wantTcp) = true;
+    std::unordered_map<DWORD, DWORD> owner;
+    auto grab = [](auto get, std::vector<BYTE>& b) {
+        DWORD sz = 0;
+        get(nullptr, &sz);
+        for (int tries = 0; tries < 3; tries++) {
+            b.resize(sz + 4096);
+            sz = (DWORD)b.size();
+            if (get(b.data(), &sz) == NO_ERROR) return true;
+        }
+        return false;
+    };
+    std::vector<BYTE> b;
+    for (ULONG af : {AF_INET, AF_INET6}) {
+        DWORD fam = af == AF_INET6 ? 0x10000 : 0;
+        if (wantTcp && grab([&](void* p, DWORD* s) { return GetExtendedTcpTable(p, s, FALSE, af, TCP_TABLE_OWNER_PID_ALL, 0); }, b)) {
+            if (af == AF_INET) { auto t = (MIB_TCPTABLE_OWNER_PID*)b.data(); for (DWORD i = 0; i < t->dwNumEntries; i++) owner[fam | (USHORT)t->table[i].dwLocalPort] = t->table[i].dwOwningPid; }
+            else { auto t = (MIB_TCP6TABLE_OWNER_PID*)b.data(); for (DWORD i = 0; i < t->dwNumEntries; i++) owner[fam | (USHORT)t->table[i].dwLocalPort] = t->table[i].dwOwningPid; }
+        }
+        if (wantUdp && grab([&](void* p, DWORD* s) { return GetExtendedUdpTable(p, s, FALSE, af, UDP_TABLE_OWNER_PID, 0); }, b)) {
+            if (af == AF_INET) { auto t = (MIB_UDPTABLE_OWNER_PID*)b.data(); for (DWORD i = 0; i < t->dwNumEntries; i++) owner[0x20000 | fam | (USHORT)t->table[i].dwLocalPort] = t->table[i].dwOwningPid; }
+            else { auto t = (MIB_UDP6TABLE_OWNER_PID*)b.data(); for (DWORD i = 0; i < t->dwNumEntries; i++) owner[0x20000 | fam | (USHORT)t->table[i].dwLocalPort] = t->table[i].dwOwningPid; }
+        }
+    }
+    for (auto& kv : ports) {
+        auto it = owner.find(kv.first);
+        if (it != owner.end() && it->second) raw[it->second].first += kv.second;
+        else unresolved += kv.second;
+    }
+}
+
 // ── 앱별 송수신: Microsoft-Windows-Kernel-Network 실시간 ETW ──
 // 이벤트 페이로드 선두 = PID(UInt32), size(UInt32). 송신/수신 이벤트 ID로 구분.
 inline const GUID& KernelNetGuid() {
@@ -151,6 +189,9 @@ struct EtwCounter {
     bool running = false;
     std::mutex mu;
     std::unordered_map<DWORD, std::pair<unsigned long long, unsigned long long>> acc;  // pid -> up,down
+    std::unordered_map<DWORD, unsigned long long> portAcc;  // PID 없는 송신: (udp|v6|로컬포트) -> 바이트
+    unsigned long long sendEvents = 0;                      // 진단용: 받은 송신 이벤트 수(누적)
+    DWORD lastErr = 0;                                      // 진단용: 마지막 시작 실패 코드
 
     static void FillProps(std::vector<BYTE>& buf) {
         size_t sz = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(EtwSessionName()) + 1) * sizeof(wchar_t) + 8;
@@ -190,6 +231,18 @@ struct EtwCounter {
             if (memcmp(da, lo6, 16) == 0) return;
         }
         std::lock_guard<std::mutex> lk(self->mu);
+        if (send) self->sendEvents++;
+        if (send && pid == 0) {
+            // 프로세스가 안 붙은 송신(시스템 문맥에서 나간 패킷 등): 로컬 포트를 기억해 뒀다가 소켓 표로 주인을 찾음.
+            // 페이로드: PID, size, daddr, saddr, dport, sport (v4 주소 4바이트 / v6 16바이트, 포트는 네트워크 순서)
+            size_t off = v6 ? 8 + 16 + 16 + 2 : 8 + 4 + 4 + 2;
+            if (r->UserDataLength >= off + 2) {
+                USHORT sport = *(const USHORT*)((const BYTE*)r->UserData + off);
+                bool udp = (id == 42 || id == 58);
+                self->portAcc[(udp ? 0x20000u : 0) | (v6 ? 0x10000u : 0) | sport] += size;
+                return;
+            }
+        }
         auto& a = self->acc[pid];
         if (send) a.first += size; else a.second += size;
     }
@@ -198,12 +251,12 @@ struct EtwCounter {
         StopStale();
         std::vector<BYTE> buf;
         FillProps(buf);
-        if (StartTraceW(&session, EtwSessionName(), (EVENT_TRACE_PROPERTIES*)buf.data()) != ERROR_SUCCESS) {
+        if ((lastErr = StartTraceW(&session, EtwSessionName(), (EVENT_TRACE_PROPERTIES*)buf.data())) != ERROR_SUCCESS) {
             session = 0;
             return false;
         }
-        if (EnableTraceEx2(session, &KernelNetGuid(), EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                           TRACE_LEVEL_VERBOSE, 0x30 /*IPv4|IPv6*/, 0, 0, nullptr) != ERROR_SUCCESS) {
+        if ((lastErr = EnableTraceEx2(session, &KernelNetGuid(), EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                      TRACE_LEVEL_VERBOSE, 0x30 /*IPv4|IPv6*/, 0, 0, nullptr)) != ERROR_SUCCESS) {
             FillProps(buf);
             ControlTraceW(session, EtwSessionName(), (EVENT_TRACE_PROPERTIES*)buf.data(), EVENT_TRACE_CONTROL_STOP);
             session = 0;
@@ -217,6 +270,7 @@ struct EtwCounter {
         lf.Context = this;
         trace = OpenTraceW(&lf);
         if (trace == (TRACEHANDLE)INVALID_HANDLE_VALUE) {
+            lastErr = GetLastError();
             FillProps(buf);
             ControlTraceW(session, EtwSessionName(), (EVENT_TRACE_PROPERTIES*)buf.data(), EVENT_TRACE_CONTROL_STOP);
             session = 0;
@@ -242,10 +296,21 @@ struct EtwCounter {
         running = false;
         std::lock_guard<std::mutex> lk(mu);
         acc.clear();
+        portAcc.clear();
     }
-    void Drain(std::unordered_map<DWORD, std::pair<unsigned long long, unsigned long long>>& out) {
+    // 버퍼에 쌓인 이벤트를 바로 내보내게 함(기본 1초 주기). 매 틱 끝에 불러 다음 틱 집계가 인터페이스 카운터와 맞게.
+    void Flush() {
+        if (!running) return;
+        std::vector<BYTE> buf;
+        FillProps(buf);
+        ControlTraceW(session, EtwSessionName(), (EVENT_TRACE_PROPERTIES*)buf.data(), EVENT_TRACE_CONTROL_FLUSH);
+    }
+    void Drain(std::unordered_map<DWORD, std::pair<unsigned long long, unsigned long long>>& out,
+               std::unordered_map<DWORD, unsigned long long>& ports) {
         std::lock_guard<std::mutex> lk(mu);
         out.swap(acc);
         acc.clear();
+        ports.swap(portAcc);
+        portAcc.clear();
     }
 };

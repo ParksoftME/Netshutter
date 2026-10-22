@@ -112,6 +112,9 @@ struct Model {
     std::wstring srcKey;
     int srcMore = 0;
     std::map<std::wstring, double> srcEma;  // 출처별 평활 업로드(바이트/초)
+    double prevTot = 0, prevAttr = 0, prevDown = 0;  // 직전 틱 (ETW 지연 보정용)
+    int etwTicks = 0;                                // ETW가 켜진 뒤 지난 틱 수
+    std::wstring srcDiag;                            // 진단 로그용 최근 출처 계산 요약
     bool AudioLeak() const { return stMic; }                 // 마이크 사용 = 음성 송출 (확실)
     bool VideoLeak() const { return stCam || stUpBig; }      // 카메라(확실) 또는 영상급 업로드(화면 추정)
     bool AnyLeak() const { return AudioLeak() || VideoLeak(); }
@@ -133,7 +136,14 @@ struct Model {
         auto it = procs.find(pid);
         if (it == procs.end() || pid == 0) return L"";
         if (IsWindowsCore(it->second.path, it->second.session)) return L"*win";
-        if (it->second.path.find(L'\\') == std::wstring::npos) return L"";  // 경로를 못 읽은 프로세스
+        if (it->second.path.find(L'\\') == std::wstring::npos) {
+            // 경로를 못 읽은 프로세스(권한·보호): 같은 실행파일의 다른 프로세스에서 경로를 빌리고, 없으면 파일 이름
+            for (auto& kv : procs)
+                if (kv.second.path.find(L'\\') != std::wstring::npos &&
+                    Lower(FileStem(kv.second.path)) == Lower(FileStem(it->second.path)))
+                    return kv.second.path;
+            return it->second.path;
+        }
         // 부모를 따라 올라가며 창 있는 앱을 찾음. 창이 없으면(트레이 앱) 셸·탐색기 바로 아래의 최상위 프로세스.
         DWORD cur = pid;
         std::wstring root = it->second.path;
@@ -212,7 +222,10 @@ struct Model {
         else if (!active && etw.running && tick - lastActive > 60) etw.Stop();
 
         std::unordered_map<DWORD, std::pair<unsigned long long, unsigned long long>> raw;
-        etw.Drain(raw);
+        std::unordered_map<DWORD, unsigned long long> ports;
+        etw.Drain(raw, ports);
+        unsigned long long unresolvedPort = 0;
+        ResolvePorts(ports, raw, unresolvedPort);  // PID 없는 송신 → 소켓 주인
 
         bool wantPkg = !micK.empty() || !camK.empty();
         if (!raw.empty() || wantPkg || !micP.empty() || !camP.empty() || anyListed)
@@ -265,17 +278,41 @@ struct Model {
 
         // 업로드 출처: ETW로 실제 송신이 확인된 프로세스만 출처별로 묶음. 전체 업로드 중 어느 프로세스에도
         // 귀속되지 않은 몫(헤더·ACK 몫 제외)은 "불분명". 순간 출렁임에 이름이 바뀌지 않게 몇 초 평활.
+        // ETW 이벤트는 인터페이스 카운터보다 최대 1초 늦게 오므로, 귀속 안 된 몫은 최근 2초 합으로 따짐
+        // (짧은 업로드가 첫 1초 동안 "불분명"으로 잡히지 않게).
         {
             std::map<std::wstring, double> cur;
+            std::vector<std::pair<double, DWORD>> byPid;
             double attributed = 0;
             for (auto& kv : raw) {
                 double up = kv.second.first / dt;
                 if (up <= 0) continue;
                 attributed += up;
                 cur[SourceKeyOf(kv.first, winPids, winKeys)] += up;
+                byPid.push_back({up, kv.first});
             }
-            double rest = totUp - attributed * 1.06 - 0.05 * totDown;
+            double rest2 = (totUp + prevTot) - (attributed + prevAttr) * 1.06 - 0.05 * (totDown + prevDown);
+            double rest = etw.running && etwTicks >= 2 ? std::max(0.0, std::min(rest2 / 2, totUp))
+                                                       : totUp - attributed * 1.06 - 0.05 * totDown;
+            prevTot = totUp; prevAttr = attributed; prevDown = totDown;
+            etwTicks = etw.running ? etwTicks + 1 : 0;
             if (rest > 0) cur[L""] += rest;
+            // 진단용 요약 (로그에만 씀)
+            std::sort(byPid.rbegin(), byPid.rend());
+            double portAll = 0;
+            for (auto& kv : ports) portAll += kv.second;
+            wchar_t d[800];
+            swprintf(d, 800, L"tot=%.0fKB/s attributed=%.0f noPid=%.0f(unresolved %.0f) rest=%.0f etw=%d err=%lu events=%llu",
+                     totUp / 1024, attributed / 1024, portAll / dt / 1024, unresolvedPort / dt / 1024, rest / 1024,
+                     etw.running, etw.lastErr, etw.sendEvents);
+            srcDiag = d;
+            for (size_t i = 0; i < byPid.size() && i < 3; i++) {
+                auto pi = procs.find(byPid[i].second);
+                swprintf(d, 800, L" | pid %lu %.0fKB/s %ls -> %ls", byPid[i].second, byPid[i].first / 1024,
+                         pi != procs.end() ? pi->second.path.c_str() : L"?",
+                         SourceKeyOf(byPid[i].second, winPids, winKeys).c_str());
+                srcDiag += d;
+            }
             for (auto& kv : srcEma) kv.second *= 0.4;
             for (auto& kv : cur) srcEma[kv.first] += 0.6 * kv.second;
             double top = 0;
@@ -340,6 +377,7 @@ struct Model {
         // 전송 판정: 앱 귀속과 무관하게 PC 전체 업로드로 본다(서비스·UDP 트래픽 포함).
         // 큰 다운로드에 딸려 나가는 ACK(실측 다운로드의 3.5~3.9%)는 5%를 빼서 제외.
         stUpBig = judge.Feed(totUp - 0.05 * totDown, sens);
+        etw.Flush();  // 이번 초의 이벤트를 다음 틱 전에 받도록
     }
 
     void ToggleBlock(App& a) {

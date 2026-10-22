@@ -169,8 +169,9 @@ inline std::wstring VersionString(const std::wstring& path, const wchar_t* field
 
 // 업로드 출처 표시 이름: 제품 이름 → (윈도우 기본 프로그램이면) 파일 설명 → 실행파일 이름
 inline std::wstring ProductLabel(const std::wstring& path, WORD lang) {
-    std::wstring s = VersionString(path, L"ProductName", lang);
-    if (s.empty() || s.find(L"Operating System") != std::wstring::npos || s.find(L"운영 체제") != std::wstring::npos)
+    bool full = path.find(L'\\') != std::wstring::npos;  // 파일 이름만 있으면 엉뚱한 파일을 찾지 않게 버전 정보는 안 읽음
+    std::wstring s = full ? VersionString(path, L"ProductName", lang) : L"";
+    if (full && (s.empty() || s.find(L"Operating System") != std::wstring::npos || s.find(L"운영 체제") != std::wstring::npos))
         s = VersionString(path, L"FileDescription", lang);
     if (s.empty()) {
         s = FileStem(path);

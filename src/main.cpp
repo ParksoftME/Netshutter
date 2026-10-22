@@ -818,7 +818,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
-        if (wp == 1) { g.Tick(h); Relayout(); InvalidateRect(h, nullptr, FALSE); }
+        if (wp == 1) {
+            bool wasUp = g.stUpBig;
+            g.Tick(h);
+            // 진단 로그: 전송 감지가 켜질 때, 그리고 출처가 불분명한 채로 이어지면 30초마다 출처 계산 요약을 남김
+            static int unknownTicks = 0;
+            unknownTicks = (g.stUpBig && g.srcKey.empty()) ? unknownTicks + 1 : 0;
+            if ((g.stUpBig && !wasUp) || (unknownTicks && unknownTicks % 30 == 0))
+                Log(L"upload on, source=%ls: %ls", g.srcKey.empty() ? L"(unknown)" : g.srcKey.c_str(), g.srcDiag.c_str());
+            static DWORD loggedErr = 0;
+            if (g.etw.lastErr && g.etw.lastErr != loggedErr) Log(L"ETW start failed (err=%lu)", g.etw.lastErr);
+            loggedErr = g.etw.lastErr;
+            Relayout(); InvalidateRect(h, nullptr, FALSE);
+        }
         else if (wp == kFxTimer) LocateFxFrame();
         else if (wp == kTrayTimer) TrayAdd();
         else if (wp == 2) {

@@ -666,28 +666,27 @@ static void Paint() {
             gr.DrawString(T(L"화면·영상·파일 전송 없음", L"No screen, video or file upload"), -1, &fSub,
                           RectF(px + Sx(36), cy + Sx(1), (float)(W - Sx(56)), (float)Sx(16)), &sfL, &sub);
         } else {
-            // ── 화면·영상·파일 전송 중: 맨 위 제목 + 전체 속도, 그 아래 출처를 업로드 많은 순으로 최대 3줄(이름 · 속도).
-            //    나머지 출처는 표시하지 않음. 멈출 수단이 없으므로 버튼 없음 ──
+            // ── 화면·영상·파일 전송 중: 맨 위 제목(숫자 없음), 그 아래 감도 기준을 넘은 출처만 많은 순 최대 3줄
+            //    (이름 · 그 출처의 속도). 멈출 수단이 없으므로 버튼 없음 ──
             bar(top + Sx(12), (float)Sx(BODYH - 24), cOrange);
             float ty = top + Sx(10), th = (float)Sx(20);  // 제목 줄
             Icon(gr, ICscreenUp, px + Sx(9), ty + th / 2 - Sx(9), Sx(18), cOrange, 1.5f);
             float tx = px + Sx(36), xr = (float)(W - Sx(12));
-            std::wstring total = FmtBytesRate(view.total);
-            RectF tb; gr.MeasureString(total.c_str(), -1, &fRow, PointF(0, 0), &tb);
             StringFormat sfR; sfR.SetAlignment(StringAlignmentFar); sfR.SetLineAlignment(StringAlignmentCenter);
             sfR.SetFormatFlags(StringFormatFlagsNoWrap);
-            SolidBrush ob(cOrangeText);
+            const Color cUpText = Col(0xF0, 0x93, 0x2B);  // 제목·출처 속도 공통 주황
+            SolidBrush ob(cUpText);
             gr.DrawString(T(L"화면·영상·파일 전송 중", L"Screen/video/file upload"), -1, &fRow,
-                          RectF(tx, ty, xr - tx - tb.Width - Sx(4), th), &sfL, &ob);
-            gr.DrawString(total.c_str(), -1, &fRow, RectF(tx, ty, xr - tx, th), &sfR, &ob);
+                          RectF(tx, ty, xr - tx, th), &sfL, &ob);
             const auto& rows = view.rows;
             float ry = ty + th + Sx(4), rhh = (float)Sx(16);
-            SolidBrush nb(cFg), sb(cDim);
+            Font fSubB(&ff, 8.f * gDpi, FontStyleBold, UnitPixel);
+            SolidBrush nb(Col(205, 205, 210));  // 앱 이름: 보통 굵기 밝은 회색, 속도: 굵게 제목과 같은 주황
             for (size_t i = 0; i < rows.size() && i < 3; i++, ry += rhh) {
                 std::wstring sp = FmtBytesRate(rows[i].second);
-                RectF sbx; gr.MeasureString(sp.c_str(), -1, &fSub, PointF(0, 0), &sbx);
+                RectF sbx; gr.MeasureString(sp.c_str(), -1, &fSubB, PointF(0, 0), &sbx);
                 gr.DrawString(SourceLabel(rows[i].first).c_str(), -1, &fSub, RectF(tx, ry, xr - tx - sbx.Width - Sx(6), rhh), &sfL, &nb);
-                gr.DrawString(sp.c_str(), -1, &fSub, RectF(tx, ry, xr - tx, rhh), &sfR, &sb);
+                gr.DrawString(sp.c_str(), -1, &fSubB, RectF(tx, ry, xr - tx, rhh), &sfR, &ob);
             }
         }
     }

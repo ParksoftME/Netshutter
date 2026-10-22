@@ -31,53 +31,61 @@ inline bool IsStreamApp(const std::wstring& path) {
     return false;
 }
 
-// 전송(화면·영상·파일) 판정: "최근 N초 평균 업로드"만 본다.
-//  켜짐: 평균 ≥ kOn,  꺼짐: 평균 < kOff (kOff < kOn 이라 경계에서 깜빡이지 않음)
-//  감도는 평균 내는 시간 N만 다름: 민감 2초, 보통 3초, 둔감 5초
-//  보통·둔감은 켜질 때 하나 더: 최근 W초 중 K초 이상이 켜짐 기준(kOn) 이상이어야 함.
-//   사진 한 장은 1~2초에 몰려 나가 평균은 높아도 이 조건을 못 채움. 화면 공유의 순간 끊김 1초는 허용.
-//   보통 4초 중 3초(2초 이상 계속), 둔감 6초 중 5초(4초 이상 계속). 민감은 평균만(사진 한 장도 잡음).
-//  켜지면 최소 3초 유지(깜빡임 방지). 그 뒤 꺼짐은 5초 평균으로 확실할 때만.
-//  위젯에 보이는 속도도 이 평균(avg)이라, 표시가 kOff보다 낮으면 항상 "외부 전송 없음".
-// 기준값(실측): 평소(아무것도 안 할 때) 2초 평균 최대 28KB/s, 480kbps 화면 공유 평균 약 62KB/s.
-//  켜짐 48KB/s(384kbps)는 그 사이, 꺼짐 24KB/s(192kbps)는 평소 중앙값(3~4KB/s)보다 충분히 위.
-// 입력 eff는 업로드 - 다운로드×5% (큰 다운로드에 딸려 나가는 ACK 3.5~3.9%를 뺌).
-struct UploadJudge {
-    static constexpr double kOn = 48 * 1024;
-    static constexpr double kOff = 24 * 1024;
-    std::deque<double> hist;  // 최근 6초
-    double avg = 0;           // 판정·표시 공통 평균 (꺼져 있을 땐 N초, 켜진 직후 3초는 N+경과초, 그 뒤 kOffWin초)
-    bool on = false;
-    int onFor = 0;            // 켜진 뒤 지난 초 (최소 3초 유지)
-    static constexpr size_t kOffWin = 5;  // 켜져 있는 동안 꺼짐 판정·표시에 쓰는 평균 창(초)
+// 전송(화면·영상·파일) 판정은 출처별로. 출처 = 업로드를 보낸 앱, 또는 "출처 불분명"(앱으로 귀속 안 된 몫).
+//  어떤 출처 하나가 감도 기준 이상으로 계속 보낼 때만 "전송 중". 기준: 민감 50KB/s, 보통 150KB/s, 둔감 1MB/s
+//  켜짐(출처별): 최근 N초 평균 ≥ 기준 (N: 민감 2, 보통 3, 둔감 5. 출처가 없던 초는 0으로 셈)
+//   보통·둔감은 하나 더: 최근 4초 중 3초 / 6초 중 5초가 기준 이상(계속 보냄) → 사진 한 장은 안 잡힘
+//  표시값(출처별): 최근 kShowWin초 안에서 기준 이상이었던 가장 최근 N초 평균. 켜진 출처는 그런 값이 없으면 꺼짐
+//   → 켜지면 최소 kShowWin초 유지, 꺼짐은 그만큼 연속으로 기준 밑일 때만, 화면의 출처 줄은 항상 기준 이상.
+// 입력은 출처별 이번 초 업로드(바이트/초). 다운로드에 딸린 ACK는 앱별 집계에 안 잡혀 불분명 몫에서 5%로 뺌.
+struct SourceJudge {
+    static constexpr size_t kShowWin = 5;
+    static double Threshold(int sens) { return sens == 2 ? 50.0 * 1024 : sens == 1 ? 150.0 * 1024 : 1024.0 * 1024; }
     static size_t Window(int sens) { return sens == 2 ? 2 : sens == 1 ? 3 : 5; }
-    double Avg(size_t n) const {
-        n = std::min(n, hist.size());
-        double sum = 0;
-        for (size_t i = hist.size() - n; i < hist.size(); i++) sum += hist[i];
-        return n ? sum / n : 0;
-    }
-    bool Feed(double eff, int sens) {
-        hist.push_back(eff > 0 ? eff : 0);
-        if (hist.size() > 6) hist.pop_front();
-        size_t n = Window(sens);
-        if (!on) {
-            // 계속 올라가는 초 수: 보통 4초 중 3초, 둔감 6초 중 5초 (민감은 조건 없음)
-            size_t w = sens == 1 ? 4 : 6, k = sens == 1 ? 3 : 5;
-            size_t busy = 0;
-            for (size_t i = hist.size() > w ? hist.size() - w : 0; i < hist.size(); i++) busy += hist[i] >= kOn;
-            bool sustained = sens == 2 || busy >= k;
-            if (Avg(n) >= kOn && sustained) { on = true; onFor = 0; }
-        } else {
-            // 켜지면 최소 3초 유지, 그 뒤 최근 kOffWin초 평균이 꺼짐 기준 밑이면 꺼짐.
-            // 긴 창으로 봐서 업로드 사이 잠깐 쉬는 틈에 꺼졌다 바로 다시 켜지지 않음(꺼짐은 확실할 때만).
-            onFor++;
-            if (onFor >= 3 && Avg(kOffWin) < kOff) on = false;
+    struct Src {
+        std::deque<double> hist, avgs;  // 최근 6초 업로드, 최근 kShowWin초의 N초 평균
+        bool active = false;
+        double shown = 0;               // 표시값 (최근 kShowWin초의 N초 평균 중 최고)
+        int idle = 0;                   // 보낸 게 없는 연속 초 (오래되면 목록에서 뺌)
+    };
+    std::map<std::wstring, Src> srcs;
+    bool on = false;
+    std::vector<std::pair<std::wstring, double>> rows;  // 켜진 출처 (표시값 큰 순, 최대 3)
+    void Feed(const std::map<std::wstring, double>& cur, int sens) {
+        const double T = Threshold(sens);
+        const size_t n = Window(sens);
+        for (auto& kv : cur) if (kv.second > 0) srcs[kv.first];
+        on = false;
+        rows.clear();
+        for (auto it = srcs.begin(); it != srcs.end();) {
+            Src& s = it->second;
+            auto c = cur.find(it->first);
+            double v = c != cur.end() && c->second > 0 ? c->second : 0;
+            s.hist.push_back(v);
+            if (s.hist.size() > 6) s.hist.pop_front();
+            double sum = 0;
+            for (size_t i = s.hist.size() > n ? s.hist.size() - n : 0; i < s.hist.size(); i++) sum += s.hist[i];
+            double avg = sum / n;
+            s.avgs.push_back(avg);
+            if (s.avgs.size() > kShowWin) s.avgs.pop_front();
+            // 표시값: 기준 이상이었던 가장 최근 N초 평균 (계속 보내는 동안은 지금 평균 그대로,
+            // 멈춘 뒤엔 마지막으로 기준을 넘은 값을 최대 kShowWin초 유지). 기준 이상이 없으면 그중 최고값
+            s.shown = *std::max_element(s.avgs.begin(), s.avgs.end());
+            for (auto a = s.avgs.rbegin(); a != s.avgs.rend(); ++a) if (*a >= T) { s.shown = *a; break; }
+            if (!s.active) {
+                size_t w = sens == 1 ? 4 : 6, k = sens == 1 ? 3 : 5, busy = 0;
+                for (size_t i = s.hist.size() > w ? s.hist.size() - w : 0; i < s.hist.size(); i++) busy += s.hist[i] >= T;
+                bool sustained = sens == 2 || busy >= k;
+                if (avg >= T && sustained) s.active = true;
+            } else if (s.shown < T) {
+                s.active = false;
+            }
+            if (s.active) { on = true; rows.push_back({it->first, s.shown}); }
+            s.idle = v > 0 ? 0 : s.idle + 1;
+            if (!s.active && s.idle > 10) it = srcs.erase(it); else ++it;
         }
-        // 유지 중(켜진 뒤 3초 안)에는 켜게 만든 N초를 포함한 N+경과초 평균 → kOn×N/(N+2) ≥ kOff 라
-        // 표시 숫자가 꺼짐 기준 밑으로 내려가지 않음. 그 뒤엔 꺼짐 판정과 같은 kOffWin초 평균.
-        avg = !on ? Avg(n) : onFor < 3 ? Avg(n + onFor) : Avg(kOffWin);
-        return on;
+        std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        if (rows.size() > 3) rows.resize(3);
     }
 };
 
@@ -90,14 +98,12 @@ struct Model {
     int tick = 0, lastActive = -1000;
     // 메인 UI용 통합 상태: 화면·영상·파일 전송 중이냐 / 외부 전송 없음이냐
     bool stUpBig = false;
-    double stUp = 0, stDown = 0;
-    UploadJudge judge;
+    double stDown = 0;
+    SourceJudge judge;
     int sens = 1;               // 전송 감지 감도: 0 둔감, 1 보통, 2 민감
     // 업로드 출처: 업로드 많은 순 최대 3개 (키, 평활 바이트/초). 키 = 실행파일 경로, L"*win" = 윈도우 서비스, L"" = 불분명
-    std::vector<std::pair<std::wstring, double>> srcTop;
-    std::wstring srcKey;  // 1위 (진단 로그용)
-    std::map<std::wstring, double> srcEma;  // 출처별 평활 업로드(바이트/초)
-    double prevTot = 0, prevAttr = 0, prevDown = 0;  // 직전 틱 (ETW 지연 보정용)
+    std::wstring srcKey;  // 표시 중인 1위 출처 (진단 로그용)
+    double prevTot = 0;                              // 지난 초 PC 전체 업로드 (ETW 지연 보정용)
     int etwTicks = 0;                                // ETW가 켜진 뒤 지난 틱 수
     int etwRestarts = 0;                             // 바깥에서 멈춘 ETW 세션을 다시 켠 횟수 (진단 로그용)
     std::wstring srcDiag;                            // 진단 로그용 최근 출처 계산 요약
@@ -160,42 +166,24 @@ struct Model {
         return best.empty() ? root : best;
     }
 
-    // 출처별 업로드(이번 초, 바이트/초)를 받아 평활하고 많은 순 최대 3개를 고름
-    void UpdateSources(const std::map<std::wstring, double>& cur) {
-        for (auto& kv : srcEma) kv.second *= 0.4;
-        for (auto& kv : cur) srcEma[kv.first] += 0.6 * kv.second;
-        double top = 0;
-        srcKey.clear();
-        for (auto it = srcEma.begin(); it != srcEma.end();) {
-            if (it->second < 512) { it = srcEma.erase(it); continue; }
-            if (it->second > top) { top = it->second; srcKey = it->first; }
-            ++it;
-        }
-        if (top < 8 * 1024) srcKey.clear();  // 확인된 업로드가 거의 없으면 이름을 띄우지 않음
-        srcTop.clear();
-        for (auto& kv : srcEma)
-            if (kv.second >= 8 * 1024) srcTop.push_back(kv);  // 확인된 업로드만
-        std::sort(srcTop.begin(), srcTop.end(), [](auto& a, auto& b) { return a.second > b.second; });
-        if (srcTop.size() > 3) srcTop.resize(3);
+    // 어느 앱에도 귀속되지 않은 업로드(바이트/초). ETW 앱별 이벤트는 인터페이스 카운터와 같은 초에 오기도,
+    // 1초 늦게 오기도 하므로 이번 초 전체·지난 초 전체 각각에서 이번 초 귀속분을 빼 보고 작은 쪽을 씀
+    // (큰 업로드가 시작되는 첫 초가 늦게 온 앱 몫 때문에 "출처 불분명"으로 잡히지 않게).
+    // 귀속분×1.06 = 패킷 헤더 몫, 다운로드×5% = 다운로드에 딸려 나가는 ACK(실측 3.5~3.9%).
+    static double Unattributed(double tot, double prevTot, double attributed, double down) {
+        double r = std::min(tot, prevTot) - attributed * 1.06 - 0.05 * down;
+        return r > 0 ? r : 0;
     }
 
-    // 위젯에 그릴 내용. 상태는 둘뿐이고, 숫자는 전송 중일 때만.
-    //  total = 판정에 쓰는 PC 전체 평균. rows = 출처 최대 3줄(이름 키, 속도).
-    //  출처 속도는 전체 평균을 출처별 업로드 비율로 나눈 값이라 합이 전체를 넘지 않음.
+    // 위젯에 그릴 내용. 상태는 둘뿐. 전송 중이면 기준을 넘은 출처만 많은 순 최대 3줄(이름 키, 그 출처의 속도).
     struct View {
         bool upload = false;
-        double total = 0;
         std::vector<std::pair<std::wstring, double>> rows;
     };
     View MakeView() const {
         View v;
         v.upload = stUpBig;
-        if (!v.upload) return v;
-        v.total = stUp;
-        double all = 0;
-        for (auto& kv : srcEma) all += kv.second;
-        for (auto& kv : srcTop) v.rows.push_back({kv.first, all > 0 ? stUp * kv.second / all : 0});
-        if (v.rows.empty()) v.rows.push_back({L"", stUp});  // 앱별로 확인된 게 없으면 한 줄: 출처 불분명
+        if (v.upload) v.rows = judge.rows;
         return v;
     }
 
@@ -278,9 +266,7 @@ struct Model {
         }
 
         // 업로드 출처: ETW로 실제 송신이 확인된 프로세스만 출처별로 묶음. 전체 업로드 중 어느 프로세스에도
-        // 귀속되지 않은 몫(헤더·ACK 몫 제외)은 "불분명". 순간 출렁임에 이름이 바뀌지 않게 몇 초 평활.
-        // ETW 이벤트는 인터페이스 카운터보다 최대 1초 늦게 오므로, 귀속 안 된 몫은 최근 2초 합으로 따짐
-        // (짧은 업로드가 첫 1초 동안 "불분명"으로 잡히지 않게).
+        // 귀속되지 않은 몫(헤더·ACK 몫 제외)은 "출처 불분명" 출처로 (Unattributed 참고).
         {
             std::map<std::wstring, double> cur;
             std::vector<std::pair<double, DWORD>> byPid;
@@ -292,10 +278,9 @@ struct Model {
                 cur[SourceKeyOf(kv.first, winPids, winKeys)] += up;
                 byPid.push_back({up, kv.first});
             }
-            double rest2 = (totUp + prevTot) - (attributed + prevAttr) * 1.06 - 0.05 * (totDown + prevDown);
-            double rest = etw.running && etwTicks >= 2 ? std::max(0.0, std::min(rest2 / 2, totUp))
+            double rest = etw.running && etwTicks >= 2 ? Unattributed(totUp, prevTot, attributed, totDown)
                                                        : totUp - attributed * 1.06 - 0.05 * totDown;
-            prevTot = totUp; prevAttr = attributed; prevDown = totDown;
+            prevTot = totUp;
             etwTicks = etw.running ? etwTicks + 1 : 0;
             if (rest > 0) cur[L""] += rest;
             // 진단용 요약 (로그에만 씀)
@@ -314,7 +299,8 @@ struct Model {
                          SourceKeyOf(byPid[i].second, winPids, winKeys).c_str());
                 srcDiag += d;
             }
-            UpdateSources(cur);
+            judge.Feed(cur, sens);  // 출처별 판정
+            srcKey = judge.rows.empty() ? L"" : judge.rows[0].first;
         }
 
         for (auto it = apps.begin(); it != apps.end();) {
@@ -356,8 +342,7 @@ struct Model {
         stDown = totDown;
         // 전송 판정: 앱 귀속과 무관하게 PC 전체 업로드로 본다(서비스·UDP 트래픽 포함).
         // 큰 다운로드에 딸려 나가는 ACK(실측 다운로드의 3.5~3.9%)는 5%를 빼서 제외.
-        stUpBig = judge.Feed(totUp - 0.05 * totDown, sens);
-        stUp = judge.avg;  // 위젯 표시 속도 = 판정에 쓰는 평균
+        stUpBig = judge.on;
         etw.Flush();  // 이번 초의 이벤트를 다음 틱 전에 받도록
     }
 

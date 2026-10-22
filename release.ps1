@@ -1,9 +1,10 @@
-# 새 버전 릴리스: 저장소의 버전(netmeter.rc·manifest)을 올리고 로컬 빌드로 확인한 뒤, 커밋·태그·push.
+﻿# 새 버전 릴리스: 저장소의 버전(netmeter.rc·manifest)을 올리고 로컬 빌드로 확인한 뒤, 커밋·태그·push.
 # 태그를 받은 GitHub Actions가 같은 소스로 빌드해 릴리스를 만든다 → 로컬 빌드와 배포본 버전이 항상 같음.
 # 사용: powershell -ExecutionPolicy Bypass -File release.ps1 1.0.2
 param([Parameter(Mandatory = $true)][string]$Version)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+[Environment]::CurrentDirectory = $PSScriptRoot  # cmd·git 같은 외부 프로그램도 이 폴더에서 실행되게
 if ($Version -notmatch '^(\d+)\.(\d+)\.(\d+)$') { throw "버전은 X.Y.Z 형식이어야 합니다: $Version" }
 $comma = "$($Matches[1]),$($Matches[2]),$($Matches[3]),0"
 $dot = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
@@ -24,7 +25,7 @@ $m = [IO.File]::ReadAllText($mf) -replace '(<assemblyIdentity version=")[^"]*"',
 [IO.File]::WriteAllText($mf, $m)
 
 # 2) 로컬 빌드로 확인
-cmd /c build.bat
+cmd /c "`"$PSScriptRoot\build.bat`""
 if ($LASTEXITCODE -ne 0) { throw '빌드 실패: 버전 변경은 커밋하지 않았습니다.' }
 $built = (Get-Item NetShutter.exe).VersionInfo.ProductVersion
 if ($built -ne $dot) { throw "빌드된 exe 버전($built)이 $dot 와 다릅니다." }

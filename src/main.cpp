@@ -648,7 +648,8 @@ static void Paint() {
             SolidBrush b(c); gr.FillPath(&b, &p);
         };
         float cy = top + Sx(BODYH) / 2.f;
-        if (!g.stUpBig) {
+        const Model::View view = g.MakeView();  // 상태·숫자·출처는 모두 여기서 (판정과 같은 값)
+        if (!view.upload) {
             // ── 외부 전송 없음: 녹색 체크 (사실만 표시, "안전" 단정 안 함) ──
             bar(top + Sx(12), (float)Sx(BODYH - 24), cGreen);
             float ix = px + Sx(9);
@@ -671,7 +672,7 @@ static void Paint() {
             float ty = top + Sx(10), th = (float)Sx(20);  // 제목 줄
             Icon(gr, ICscreenUp, px + Sx(9), ty + th / 2 - Sx(9), Sx(18), cOrange, 1.5f);
             float tx = px + Sx(36), xr = (float)(W - Sx(12));
-            std::wstring total = FmtBytesRate(g.stUp);
+            std::wstring total = FmtBytesRate(view.total);
             RectF tb; gr.MeasureString(total.c_str(), -1, &fRow, PointF(0, 0), &tb);
             StringFormat sfR; sfR.SetAlignment(StringAlignmentFar); sfR.SetLineAlignment(StringAlignmentCenter);
             sfR.SetFormatFlags(StringFormatFlagsNoWrap);
@@ -679,8 +680,7 @@ static void Paint() {
             gr.DrawString(T(L"화면·영상·파일 전송 중", L"Screen/video/file upload"), -1, &fRow,
                           RectF(tx, ty, xr - tx - tb.Width - Sx(4), th), &sfL, &ob);
             gr.DrawString(total.c_str(), -1, &fRow, RectF(tx, ty, xr - tx, th), &sfR, &ob);
-            std::vector<std::pair<std::wstring, double>> rows = g.srcTop;
-            if (rows.empty()) rows.push_back({L"", g.stUp});  // 앱별로 확인된 게 없으면 한 줄: 출처 불분명
+            const auto& rows = view.rows;
             float ry = ty + th + Sx(4), rhh = (float)Sx(16);
             SolidBrush nb(cFg), sb(cDim);
             for (size_t i = 0; i < rows.size() && i < 3; i++, ry += rhh) {

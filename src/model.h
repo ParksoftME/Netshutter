@@ -37,6 +37,7 @@ inline bool IsStreamApp(const std::wstring& path) {
 //  보통·둔감은 켜질 때 하나 더: 최근 W초 중 K초 이상이 켜짐 기준(kOn) 이상이어야 함.
 //   사진 한 장은 1~2초에 몰려 나가 평균은 높아도 이 조건을 못 채움. 화면 공유의 순간 끊김 1초는 허용.
 //   보통 4초 중 3초(2초 이상 계속), 둔감 6초 중 5초(4초 이상 계속). 민감은 평균만(사진 한 장도 잡음).
+//  켜지면 최소 3초 유지(깜빡임 방지). 그 뒤 꺼짐은 5초 평균으로 확실할 때만.
 //  위젯에 보이는 속도도 이 평균(avg)이라, 표시가 kOff보다 낮으면 항상 "외부 전송 없음".
 // 기준값(실측): 평소(아무것도 안 할 때) 2초 평균 최대 28KB/s, 480kbps 화면 공유 평균 약 62KB/s.
 //  켜짐 48KB/s(384kbps)는 그 사이, 꺼짐 24KB/s(192kbps)는 평소 중앙값(3~4KB/s)보다 충분히 위.
@@ -45,23 +46,37 @@ struct UploadJudge {
     static constexpr double kOn = 48 * 1024;
     static constexpr double kOff = 24 * 1024;
     std::deque<double> hist;  // 최근 6초
-    double avg = 0;           // 최근 N초 평균 (판정·표시 공통)
+    double avg = 0;           // 판정·표시 공통 평균 (꺼져 있을 땐 N초, 켜진 직후 3초는 N+경과초, 그 뒤 kOffWin초)
     bool on = false;
+    int onFor = 0;            // 켜진 뒤 지난 초 (최소 3초 유지)
+    static constexpr size_t kOffWin = 5;  // 켜져 있는 동안 꺼짐 판정·표시에 쓰는 평균 창(초)
     static size_t Window(int sens) { return sens == 2 ? 2 : sens == 1 ? 3 : 5; }
+    double Avg(size_t n) const {
+        n = std::min(n, hist.size());
+        double sum = 0;
+        for (size_t i = hist.size() - n; i < hist.size(); i++) sum += hist[i];
+        return n ? sum / n : 0;
+    }
     bool Feed(double eff, int sens) {
         hist.push_back(eff > 0 ? eff : 0);
         if (hist.size() > 6) hist.pop_front();
-        size_t n = std::min(Window(sens), hist.size());
-        double sum = 0;
-        for (size_t i = hist.size() - n; i < hist.size(); i++) sum += hist[i];
-        avg = sum / n;
-        // 계속 올라가는 초 수: 보통 4초 중 3초, 둔감 6초 중 5초 (민감은 조건 없음)
-        size_t w = sens == 1 ? 4 : 6, k = sens == 1 ? 3 : 5;
-        size_t busy = 0;
-        for (size_t i = hist.size() > w ? hist.size() - w : 0; i < hist.size(); i++) busy += hist[i] >= kOn;
-        bool sustained = sens == 2 || busy >= k;
-        if (!on && avg >= kOn && sustained) on = true;
-        else if (on && avg < kOff) on = false;
+        size_t n = Window(sens);
+        if (!on) {
+            // 계속 올라가는 초 수: 보통 4초 중 3초, 둔감 6초 중 5초 (민감은 조건 없음)
+            size_t w = sens == 1 ? 4 : 6, k = sens == 1 ? 3 : 5;
+            size_t busy = 0;
+            for (size_t i = hist.size() > w ? hist.size() - w : 0; i < hist.size(); i++) busy += hist[i] >= kOn;
+            bool sustained = sens == 2 || busy >= k;
+            if (Avg(n) >= kOn && sustained) { on = true; onFor = 0; }
+        } else {
+            // 켜지면 최소 3초 유지, 그 뒤 최근 kOffWin초 평균이 꺼짐 기준 밑이면 꺼짐.
+            // 긴 창으로 봐서 업로드 사이 잠깐 쉬는 틈에 꺼졌다 바로 다시 켜지지 않음(꺼짐은 확실할 때만).
+            onFor++;
+            if (onFor >= 3 && Avg(kOffWin) < kOff) on = false;
+        }
+        // 유지 중(켜진 뒤 3초 안)에는 켜게 만든 N초를 포함한 N+경과초 평균 → kOn×N/(N+2) ≥ kOff 라
+        // 표시 숫자가 꺼짐 기준 밑으로 내려가지 않음. 그 뒤엔 꺼짐 판정과 같은 kOffWin초 평균.
+        avg = !on ? Avg(n) : onFor < 3 ? Avg(n + onFor) : Avg(kOffWin);
         return on;
     }
 };
@@ -143,6 +158,45 @@ struct Model {
             if (main && (best.empty() || d.size() < bestLen)) { best = p; bestLen = d.size(); }
         }
         return best.empty() ? root : best;
+    }
+
+    // 출처별 업로드(이번 초, 바이트/초)를 받아 평활하고 많은 순 최대 3개를 고름
+    void UpdateSources(const std::map<std::wstring, double>& cur) {
+        for (auto& kv : srcEma) kv.second *= 0.4;
+        for (auto& kv : cur) srcEma[kv.first] += 0.6 * kv.second;
+        double top = 0;
+        srcKey.clear();
+        for (auto it = srcEma.begin(); it != srcEma.end();) {
+            if (it->second < 512) { it = srcEma.erase(it); continue; }
+            if (it->second > top) { top = it->second; srcKey = it->first; }
+            ++it;
+        }
+        if (top < 8 * 1024) srcKey.clear();  // 확인된 업로드가 거의 없으면 이름을 띄우지 않음
+        srcTop.clear();
+        for (auto& kv : srcEma)
+            if (kv.second >= 8 * 1024) srcTop.push_back(kv);  // 확인된 업로드만
+        std::sort(srcTop.begin(), srcTop.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        if (srcTop.size() > 3) srcTop.resize(3);
+    }
+
+    // 위젯에 그릴 내용. 상태는 둘뿐이고, 숫자는 전송 중일 때만.
+    //  total = 판정에 쓰는 PC 전체 평균. rows = 출처 최대 3줄(이름 키, 속도).
+    //  출처 속도는 전체 평균을 출처별 업로드 비율로 나눈 값이라 합이 전체를 넘지 않음.
+    struct View {
+        bool upload = false;
+        double total = 0;
+        std::vector<std::pair<std::wstring, double>> rows;
+    };
+    View MakeView() const {
+        View v;
+        v.upload = stUpBig;
+        if (!v.upload) return v;
+        v.total = stUp;
+        double all = 0;
+        for (auto& kv : srcEma) all += kv.second;
+        for (auto& kv : srcTop) v.rows.push_back({kv.first, all > 0 ? stUp * kv.second / all : 0});
+        if (v.rows.empty()) v.rows.push_back({L"", stUp});  // 앱별로 확인된 게 없으면 한 줄: 출처 불분명
+        return v;
     }
 
     std::vector<App*> Rows() {
@@ -260,21 +314,7 @@ struct Model {
                          SourceKeyOf(byPid[i].second, winPids, winKeys).c_str());
                 srcDiag += d;
             }
-            for (auto& kv : srcEma) kv.second *= 0.4;
-            for (auto& kv : cur) srcEma[kv.first] += 0.6 * kv.second;
-            double top = 0;
-            srcKey.clear();
-            for (auto it = srcEma.begin(); it != srcEma.end();) {
-                if (it->second < 512) { it = srcEma.erase(it); continue; }
-                if (it->second > top) { top = it->second; srcKey = it->first; }
-                ++it;
-            }
-            if (top < 8 * 1024) srcKey.clear();  // 확인된 업로드가 거의 없으면 이름을 띄우지 않음
-            srcTop.clear();
-            for (auto& kv : srcEma)
-                if (kv.second >= 8 * 1024) srcTop.push_back(kv);  // 확인된 업로드만
-            std::sort(srcTop.begin(), srcTop.end(), [](auto& a, auto& b) { return a.second > b.second; });
-            if (srcTop.size() > 3) srcTop.resize(3);
+            UpdateSources(cur);
         }
 
         for (auto it = apps.begin(); it != apps.end();) {

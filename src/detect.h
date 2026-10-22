@@ -1,6 +1,5 @@
-// 감지: (1) 마이크·카메라 사용 앱 — 윈도우 프라이버시 기록(ConsentStore)을 읽음
-//       (2) 앱별 송수신량 — Kernel-Network ETW 세션 (활동 중일 때만 켬)
-// 둘 다 윈도우가 공개한 자체 기록/계측을 읽는 방식이고, 다른 앱 메모리는 건드리지 않음.
+// 감지: 전체 송수신량(인터페이스 카운터) + 앱별 송수신량(Kernel-Network ETW 세션, 활동 중일 때만 켬)
+// 윈도우가 공개한 계측을 읽는 방식이고, 다른 앱 메모리는 건드리지 않음.
 #pragma once
 #include "common.h"
 #include "proc.h"
@@ -8,116 +7,12 @@
 #include <evntcons.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
-#include <mmdeviceapi.h>
-#include <audiopolicy.h>
 #include <vector>
 #include <set>
 #include <mutex>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
-
-// ── 마이크·카메라: 작업표시줄 마이크 아이콘이 읽는 바로 그 레지스트리 ──
-inline bool ConsentInUse(HKEY h, const wchar_t* sub) {
-    ULONGLONG start = 0, stop = 1;
-    DWORD sz = sizeof(start);
-    if (RegGetValueW(h, sub, L"LastUsedTimeStart", RRF_RT_REG_QWORD, nullptr, &start, &sz) != ERROR_SUCCESS) return false;
-    sz = sizeof(stop);
-    if (RegGetValueW(h, sub, L"LastUsedTimeStop", RRF_RT_REG_QWORD, nullptr, &stop, &sz) != ERROR_SUCCESS) return false;
-    return start != 0 && stop == 0;  // 시작됨, 아직 안 멈춤 = 지금 사용 중
-}
-inline void ReadConsent(HKEY root, const wchar_t* cap, std::set<std::wstring>& paths, std::set<std::wstring>& pkgs) {
-    std::wstring base = L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\";
-    base += cap;
-    HKEY h;
-    if (RegOpenKeyExW(root, base.c_str(), 0, KEY_READ, &h) != ERROR_SUCCESS) return;
-    wchar_t name[512];
-    for (DWORD i = 0;; i++) {
-        DWORD n = 512;
-        if (RegEnumKeyExW(h, i, name, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-        if (_wcsicmp(name, L"NonPackaged") == 0) {
-            HKEY hn;
-            if (RegOpenKeyExW(h, name, 0, KEY_READ, &hn) != ERROR_SUCCESS) continue;
-            wchar_t sub[1024];
-            for (DWORD j = 0;; j++) {
-                DWORD m = 1024;
-                if (RegEnumKeyExW(hn, j, sub, &m, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-                if (ConsentInUse(hn, sub)) {
-                    std::wstring p = sub;
-                    std::replace(p.begin(), p.end(), L'#', L'\\');
-                    paths.insert(Lower(p));
-                }
-            }
-            RegCloseKey(hn);
-        } else if (ConsentInUse(h, name)) {
-            pkgs.insert(Lower(name));  // UWP 패키지는 패밀리명으로
-        }
-    }
-    RegCloseKey(h);
-}
-
-// ── 마이크: 녹음 장치의 활성 오디오 세션 (WASAPI) ──
-// 25H2 이후 ConsentStore의 LastUsedTime 기록이 갱신되지 않는 빌드가 있어, 지금 실제로
-// 녹음 스트림을 돌리는 프로세스를 오디오 엔진에서 직접 읽는다. 패키지/일반 앱 구분 없음.
-// 장치별 세션 관리자는 캐시하고 5초마다(또는 실패 시) 장치 목록을 다시 읽어 호출 비용을 줄임.
-struct MicSessionCache {
-    std::vector<IAudioSessionManager2*> mgrs;
-    DWORD lastEnum = 0;
-    bool valid = false;
-    void Clear() { for (auto m : mgrs) m->Release(); mgrs.clear(); valid = false; }
-    void Refresh() {
-        Clear();
-        lastEnum = GetTickCount();
-        IMMDeviceEnumerator* en = nullptr;
-        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                    __uuidof(IMMDeviceEnumerator), (void**)&en))) return;
-        IMMDeviceCollection* col = nullptr;
-        if (SUCCEEDED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &col))) {
-            UINT n = 0;
-            col->GetCount(&n);
-            for (UINT i = 0; i < n; i++) {
-                IMMDevice* d = nullptr;
-                if (FAILED(col->Item(i, &d))) continue;
-                IAudioSessionManager2* mgr = nullptr;
-                if (SUCCEEDED(d->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)))
-                    mgrs.push_back(mgr);
-                d->Release();
-            }
-            col->Release();
-        }
-        en->Release();
-        valid = true;
-    }
-};
-inline void MicCapturePaths(std::set<std::wstring>& paths) {
-    static MicSessionCache cache;
-    if (!cache.valid || GetTickCount() - cache.lastEnum >= 5000) cache.Refresh();
-    bool failed = false;
-    for (auto mgr : cache.mgrs) {
-        IAudioSessionEnumerator* se = nullptr;
-        if (FAILED(mgr->GetSessionEnumerator(&se))) { failed = true; continue; }  // 장치 분리 등
-        int cnt = 0;
-        se->GetCount(&cnt);
-        for (int k = 0; k < cnt; k++) {
-            IAudioSessionControl* sc = nullptr;
-            if (FAILED(se->GetSession(k, &sc))) continue;
-            AudioSessionState st = AudioSessionStateInactive;
-            IAudioSessionControl2* sc2 = nullptr;
-            if (SUCCEEDED(sc->GetState(&st)) && st == AudioSessionStateActive &&
-                SUCCEEDED(sc->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&sc2))) {
-                DWORD pid = 0;
-                if (SUCCEEDED(sc2->GetProcessId(&pid)) && pid && pid != GetCurrentProcessId()) {
-                    std::wstring p = PathOfPid(pid);
-                    if (!p.empty()) paths.insert(p);
-                }
-                sc2->Release();
-            }
-            sc->Release();
-        }
-        se->Release();
-    }
-    if (failed) cache.valid = false;  // 다음 틱에 장치 목록 다시 읽기
-}
 
 // ── 전체 인터페이스 누적 바이트 (활동 게이트 + 폴백 표시용) ──
 inline bool TotalOctets(unsigned long long& in, unsigned long long& out) {

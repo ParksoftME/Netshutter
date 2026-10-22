@@ -1,67 +1,13 @@
-// 2차 동작: 마이크 끄기(시스템 녹음 장치 음소거) / 네트워크 차단(윈도우 방화벽 규칙)
-// 둘 다 윈도우 공개 API(Core Audio, Windows Firewall)만 사용. 앱을 죽이지 않고 되돌릴 수 있음.
+// 2차 동작: 네트워크 차단(윈도우 방화벽 규칙). 윈도우 공개 API(Windows Firewall)만 사용, 되돌릴 수 있음.
 #pragma once
 #include "common.h"
 #include "proc.h"
 #include <objbase.h>
-#include <mmdeviceapi.h>
-#include <endpointvolume.h>
 #include <netfw.h>
 #include <iphlpapi.h>
 #include <vector>
 #include <set>
 #include <map>
-
-// ── 마이크: 활성 녹음 장치 전체 음소거/해제 (앱별 끄기는 윈도우 미지원이라 장치 단) ──
-inline int MicMuteState() {  // 1=전부 음소거, 0=하나라도 켜짐, -1=장치/실패
-    IMMDeviceEnumerator* en = nullptr;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                __uuidof(IMMDeviceEnumerator), (void**)&en))) return -1;
-    IMMDeviceCollection* col = nullptr;
-    int state = -1;
-    if (SUCCEEDED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &col))) {
-        UINT n = 0;
-        col->GetCount(&n);
-        for (UINT i = 0; i < n; i++) {
-            IMMDevice* d = nullptr;
-            if (FAILED(col->Item(i, &d))) continue;
-            IAudioEndpointVolume* v = nullptr;
-            if (SUCCEEDED(d->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&v))) {
-                BOOL m = FALSE;
-                v->GetMute(&m);
-                if (state == -1) state = 1;
-                if (!m) state = 0;
-                v->Release();
-            }
-            d->Release();
-        }
-        col->Release();
-    }
-    en->Release();
-    return state;
-}
-inline void MicSetMute(BOOL mute) {
-    IMMDeviceEnumerator* en = nullptr;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                __uuidof(IMMDeviceEnumerator), (void**)&en))) return;
-    IMMDeviceCollection* col = nullptr;
-    if (SUCCEEDED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &col))) {
-        UINT n = 0;
-        col->GetCount(&n);
-        for (UINT i = 0; i < n; i++) {
-            IMMDevice* d = nullptr;
-            if (FAILED(col->Item(i, &d))) continue;
-            IAudioEndpointVolume* v = nullptr;
-            if (SUCCEEDED(d->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&v))) {
-                v->SetMute(mute, nullptr);
-                v->Release();
-            }
-            d->Release();
-        }
-        col->Release();
-    }
-    en->Release();
-}
 
 // ── 네트워크: 특정 실행파일의 인바운드/아웃바운드를 방화벽에서 차단/해제 ──
 inline const wchar_t* FwGroup() { return L"KGNF NetShutter"; }
@@ -144,28 +90,6 @@ inline void FwBlockRemove(const std::wstring& path) {
     rules->Release();
     pol->Release();
 }
-// ── 카메라 전역 차단/해제 (윈도우 카메라 접근 설정) ──
-// ConsentStore\webcam 의 Value를 Deny/Allow로. 이미 핸들을 연 앱엔 즉시 적용이 늦을 수 있음.
-inline void CameraSetBlocked(bool block) {
-    const wchar_t* key = L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\webcam";
-    const wchar_t* val = block ? L"Deny" : L"Allow";
-    for (HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}) {
-        HKEY h;
-        if (RegOpenKeyExW(root, key, 0, KEY_SET_VALUE, &h) == ERROR_SUCCESS) {
-            RegSetValueExW(h, L"Value", 0, REG_SZ, (const BYTE*)val, (DWORD)((wcslen(val) + 1) * sizeof(wchar_t)));
-            RegCloseKey(h);
-        }
-    }
-}
-inline bool CameraIsBlocked() {
-    wchar_t buf[16]; DWORD sz = sizeof(buf);
-    if (RegGetValueW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\webcam",
-        L"Value", RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS)
-        return _wcsicmp(buf, L"Deny") == 0;
-    return false;
-}
-
 // ── 지금 외부(인터넷)와 통신 중인 프로세스 경로 수집 (연결 테이블 기반) ──
 // ETW 귀속과 무관하게 소켓 owner PID로 잡으므로 크롬 원격·UDP·서비스도 정확히 잡힘.
 inline bool IsLocalOrLan(DWORD addrBE) {

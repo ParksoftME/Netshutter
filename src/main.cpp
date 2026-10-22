@@ -23,8 +23,8 @@ static NOTIFYICONDATAW gTray{};
 static ULONG_PTR gGdip = 0;
 static float gDpi = 1.f;
 static int gHoverRow = -1;      // 마우스가 올라간 줄
-static int gHoverBtn = -1;      // -1=없음, 0=마이크, 1=네트워크
-static bool gBlinkOn = false;   // 트레이 송출 깜빡임 위상
+static int gHoverBtn = -1;      // -1=없음, 3=X, 4=메뉴, 5=감도 슬라이더
+static bool gBlinkOn = false;   // 전송 중 깜빡임 위상
 static bool gAlwaysTop = false; // 항상 위 (기본 끔)
 static bool gHideCapture = false; // 방송 화면에서 숨기기 (기본 끔)
 static bool gMenuOpen = false;  // 메뉴 떠 있는 동안 z-순서 고정
@@ -104,7 +104,7 @@ static std::vector<Hit> gHits;
 
 // ── 디자인 토큰 (캔버스 시안과 동일 계열) ──
 static const float ROWH = 22, PADW = 4, RAD = 9, HEADERH = 18;
-static const float BODYW = 260, BODYH = 64;  // 고정 본문 크기 (헤더 자리는 그 위)
+static const float BODYW = 260, BODYH = 96;  // 고정 본문 크기 (헤더 자리는 그 위). 전송 중 출처 3줄까지 들어가는 높이
 
 // 셔터(조리개) 로고: assets/icon/netshutter.svg 를 64 단위 좌표 그대로 옮김
 static void DrawLogo(Gdiplus::Graphics& gr, float x, float y, float s) {
@@ -163,8 +163,7 @@ static const Color cBg = Col(28, 28, 30, 244), cBorder = Col(255, 255, 255, 24),
 // 상태 색: 배경은 항상 같은 어두운 색, 상태는 막대·아이콘·글자색으로만
 static const Color cPanel = Col(24, 32, 27), cFrame = Col(40, 46, 43),
                    cGreen = Col(74, 200, 120), cGreenText = Col(120, 220, 150),
-                   cOrange = Col(255, 150, 50), cOrangeText = Col(255, 190, 125),
-                   cRedA = Col(235, 64, 52), cRedText = Col(255, 140, 128);
+                   cOrange = Col(255, 150, 50), cOrangeText = Col(255, 190, 125);
 
 static int Sx(float v) { return (int)(v * gDpi + 0.5f); }
 
@@ -189,7 +188,7 @@ static void RoundRect(GraphicsPath& p, RectF r, float rad) {
 }
 
 // 12×12 그리드 아이콘을 (x,y) size px 로 그림
-enum IconId { ICmic, ICmicOff, ICcam, ICup, ICnet, ICnetOff, IClock, ICtray, ICscreenUp };
+enum IconId { ICup, ICnet, ICnetOff, IClock, ICtray, ICscreenUp };
 static void Icon(Graphics& gr, IconId id, float x, float y, float size, Color c, float sw = 1.4f) {
     float k = size / 12.f;
     Pen pen(c, sw * k);
@@ -200,14 +199,6 @@ static void Icon(Graphics& gr, IconId id, float x, float y, float size, Color c,
         GraphicsPath p; RoundRect(p, RectF(x + ax * k, y + ay * k, aw * k, ah * k), 1.0f * k); gr.DrawPath(&pen, &p);
     };
     switch (id) {
-    case ICmic: case ICmicOff:
-        RR(4.2f, 1, 3.6f, 6); Arc(2.5f, 3.3f, 7, 5, 20, 140); L(6, 9.3f, 6, 11);
-        if (id == ICmicOff) L(1.5f, 1.5f, 10.5f, 10.5f);
-        break;
-    case ICcam:  // 카메라: 몸체 + 렌즈
-        RR(1, 2.5f, 10, 7);
-        gr.DrawEllipse(&pen, x + 4 * k, y + 4 * k, 4 * k, 4 * k);
-        break;
     case ICup:   // 업로드: 위 화살표
         L(6, 10.5f, 6, 2); L(2.5f, 5.5f, 6, 2); L(6, 2, 9.5f, 5.5f);
         break;
@@ -468,44 +459,17 @@ static std::wstring FmtBytesRate(double bps) {  // 바이트/초 → "1.8 MB/s"
     else swprintf(buf, 32, L"%.0f B/s", bps);
     return buf;
 }
-static std::wstring AppNames(bool mic) {  // 마이크/카메라 사용 중인 앱 이름들
-    std::wstring s;
-    for (auto& kv : g.apps) {
-        const App& a = kv.second;
-        if (!(mic ? a.mic : a.cam)) continue;
-        if (!s.empty()) s += L", ";
-        s += a.name;
-    }
-    return s.empty() ? std::wstring(T(L"알 수 없는 앱", L"Unknown app")) : s;
-}
 
 // 업로드 출처 이름 (현재 언어). 실행파일 버전 정보 읽기는 출처·언어별로 한 번만.
-static std::wstring SourceLabel() {
-    if (g.srcKey.empty()) return T(L"출처 불분명", L"Unknown source");
-    if (g.srcKey == L"*win") return T(L"Windows 서비스", L"Windows services");
+static std::wstring SourceLabel(const std::wstring& key) {
+    if (key.empty()) return T(L"출처 불분명", L"Unknown source");
+    if (key == L"*win") return T(L"Windows 서비스", L"Windows services");
     static std::map<std::wstring, std::wstring> cache;
-    std::wstring ck = std::to_wstring(gLang) + L"|" + g.srcKey;
+    std::wstring ck = std::to_wstring(gLang) + L"|" + key;
     auto it = cache.find(ck);
     if (it != cache.end()) return it->second;
     if (cache.size() > 64) cache.clear();
-    return cache[ck] = ProductLabel(g.srcKey, gLang == 0 ? 0x0412 : 0x0409);
-}
-// 업로드 출처 꼬리: "Discord" / "Discord 외 2"
-static std::wstring SourceTail(bool withMore) {
-    std::wstring s = SourceLabel();
-    if (withMore && g.srcMore > 0)
-        s += gLang == 0 ? L" 외 " + std::to_wstring(g.srcMore) : L" +" + std::to_wstring(g.srcMore);
-    return s;
-}
-// 후보 문구 중 폭 안에 들어가는 첫 번째 (모두 넘치면 마지막 것을 말줄임으로)
-static std::wstring FitFirst(Graphics& gr, const Font& f, float width, std::initializer_list<std::wstring> cands) {
-    std::wstring last;
-    for (auto& c : cands) {
-        RectF b; gr.MeasureString(c.c_str(), -1, &f, PointF(0, 0), &b);
-        if (b.Width <= width) return c;
-        last = c;
-    }
-    return last;
+    return cache[ck] = ProductLabel(key, gLang == 0 ? 0x0412 : 0x0409);
 }
 
 static void Paint() {
@@ -557,7 +521,6 @@ static void Paint() {
         Font fTitle(&ff, 11.f * gDpi, FontStyleBold, UnitPixel);
         Font fRow(&ff, 9.5f * gDpi, FontStyleBold, UnitPixel);
         Font fSub(&ff, 8.f * gDpi, FontStyleRegular, UnitPixel);
-        Font fBtn(&ff, 8.f * gDpi, FontStyleBold, UnitPixel);
         StringFormat sfL; sfL.SetAlignment(StringAlignmentNear); sfL.SetLineAlignment(StringAlignmentCenter);
         sfL.SetFormatFlags(StringFormatFlagsNoWrap); sfL.SetTrimming(StringTrimmingEllipsisCharacter);
         StringFormat sfC; sfC.SetAlignment(StringAlignmentCenter); sfC.SetLineAlignment(StringAlignmentCenter);
@@ -631,44 +594,15 @@ static void Paint() {
             gHits.push_back({RectF(mx - Sx(9), 0, (float)Sx(18), hh), -1, 4, L""});
         }
 
-        // 상태 줄: 왼쪽 색 막대 + 아이콘 + 제목/부제 + 오른쪽 버튼
+        // 상태 줄: 왼쪽 색 막대 + 아이콘 + 제목/부제. 상태는 "외부 전송 없음" / "화면·영상·파일 전송 중" 둘뿐
         float px = (float)Sx(10);
         auto bar = [&](float y, float h, Color c) {
             GraphicsPath p; RoundRect(p, RectF(px, y, (float)Sx(3), h), (float)Sx(1.5f));
             SolidBrush b(c); gr.FillPath(&b, &p);
         };
-        auto button = [&](float cy, const wchar_t* label, Color c, int code, bool off) {
-            float bw = Sx(48), bh = Sx(19), bx = W - Sx(10) - bw;
-            RectF br(bx, cy - bh / 2, bw, bh);
-            GraphicsPath p; RoundRect(p, br, (float)Sx(4));
-            Color fill = off ? Col(90, 90, 96) : c;
-            if (gHoverBtn == code) fill = Col(fill.GetR(), fill.GetG(), fill.GetB(), 220);
-            SolidBrush bb(fill); gr.FillPath(&bb, &p);
-            SolidBrush bt(Col(255, 255, 255));
-            gr.DrawString(label, -1, &fBtn, br, &sfC, &bt);
-            gHits.push_back({br, -1, code, L""});
-        };
-        // 제목 옆에 작게 붙는 보조 글 (두 줄 모드)
-        auto titleWithAside = [&](float y, float h, const std::wstring& title, const std::wstring& aside,
-                                  Color tc, float right) {
-            float tx = px + Sx(30);
-            RectF bound;
-            gr.MeasureString(title.c_str(), -1, &fRow, PointF(0, 0), &bound);
-            float tw = std::min(bound.Width, right - tx);
-            SolidBrush tb(tc);
-            gr.DrawString(title.c_str(), -1, &fRow, RectF(tx, y, tw + 1, h), &sfL, &tb);
-            if (!aside.empty() && tx + tw + Sx(4) < right) {
-                SolidBrush sb(cDim);
-                gr.DrawString(aside.c_str(), -1, &fSub, RectF(tx + tw + Sx(2), y, right - tx - tw - Sx(2), h), &sfL, &sb);
-            }
-        };
-
-        bool video = g.VideoLeak(), audio = g.AudioLeak();
-        float right = (float)(W - Sx(64));  // 버튼 앞까지
-        float rightNoBtn = (float)(W - Sx(12));  // 버튼 없는 줄(전송)은 끝까지
-        if (!video && !audio) {
+        float cy = top + Sx(BODYH) / 2.f;
+        if (!g.stUpBig) {
             // ── 외부 전송 없음: 녹색 체크 (사실만 표시, "안전" 단정 안 함) ──
-            float cy = top + Sx(BODYH) / 2.f;
             bar(top + Sx(12), (float)Sx(BODYH - 24), cGreen);
             float ix = px + Sx(9);
             SolidBrush gb(cGreen);
@@ -681,64 +615,32 @@ static void Paint() {
             SolidBrush tg(cGreenText), sub(cDim);
             gr.DrawString(T(L"외부 전송 없음", L"No outgoing transfer"), -1, &fTitle,
                           RectF(px + Sx(36), cy - Sx(19), (float)(W - Sx(56)), (float)Sx(20)), &sfL, &tg);
-            gr.DrawString(T(L"화면·영상·파일 전송 없음 · 마이크 꺼짐", L"No screen, video or file upload · Mic off"), -1, &fSub,
+            gr.DrawString(T(L"화면·영상·파일 전송 없음", L"No screen, video or file upload"), -1, &fSub,
                           RectF(px + Sx(36), cy + Sx(1), (float)(W - Sx(56)), (float)Sx(16)), &sfL, &sub);
-        } else if (video != audio) {
-            // ── 한 가지: 큰 한 줄 + 부제 ──
-            float cy = top + Sx(BODYH) / 2.f;
-            Color c = video ? cOrange : cRedA, tc = video ? cOrangeText : cRedText;
-            bar(top + Sx(12), (float)Sx(BODYH - 24), c);
-            std::wstring title, sub;
-            if (audio) {
-                Icon(gr, ICmic, px + Sx(9), cy - Sx(9), Sx(18), c, 1.5f);
-                title = T(L"마이크가 켜져 있어요", L"Microphone is on");
-                sub = AppNames(true);
-            } else if (g.stCam) {
-                Icon(gr, ICcam, px + Sx(9), cy - Sx(9), Sx(18), c, 1.5f);
-                title = std::wstring(T(L"카메라 켜짐 · ", L"Camera on · ")) + AppNames(false);
-                if (g.stUpBig) sub = std::wstring(T(L"업로드 ", L"Upload ")) + FmtBytesRate(g.stUp);
-            } else {
-                Icon(gr, ICscreenUp, px + Sx(9), cy - Sx(9), Sx(18), c, 1.5f);
-                title = T(L"화면·영상·파일 전송 중", L"Screen/video/file upload");
-                sub = std::wstring(T(L"업로드 ", L"Upload ")) + FmtBytesRate(g.stUp);
-            }
-            SolidBrush tb(tc), sb(cDim);
-            bool upOnly = video && !g.stCam;  // 전송 줄: 업로드를 멈출 수단이 없으므로 버튼 없음
-            float tx = px + Sx(36), tw = (upOnly ? rightNoBtn : right) - tx;
-            if (upOnly)  // 업로드 속도 뒤에 출처. 길면 "외 N"부터 뺌
-                sub = FitFirst(gr, fSub, tw, {sub + L" · " + SourceTail(true), sub + L" · " + SourceTail(false)});
-            if (sub.empty()) {
-                gr.DrawString(title.c_str(), -1, &fRow, RectF(tx, cy - Sx(10), tw, (float)Sx(20)), &sfL, &tb);
-            } else {
-                gr.DrawString(title.c_str(), -1, &fRow, RectF(tx, cy - Sx(18), tw, (float)Sx(18)), &sfL, &tb);
-                gr.DrawString(sub.c_str(), -1, &fSub, RectF(tx, cy + Sx(1), tw, (float)Sx(16)), &sfL, &sb);
-            }
-            if (audio) button(cy, g.micMuted == 1 ? T(L"해제", L"Unmute") : T(L"음소거", L"Mute"), c, 11, g.micMuted == 1);
-            else if (!upOnly) { bool off = CameraIsBlocked(); button(cy, off ? T(L"해제", L"On") : T(L"끄기", L"Off"), c, 10, off); }
         } else {
-            // ── 둘 다: 본문 안에서 두 줄, 줄마다 버튼 ──
-            float rh = Sx(BODYH) / 2.f;
-            for (int row = 0; row < 2; row++) {
-                float y = top + row * rh, cy = y + rh / 2.f;
-                bool isVideo = row == 0;
-                Color c = isVideo ? cOrange : cRedA, tc = isVideo ? cOrangeText : cRedText;
-                bar(y + Sx(6), rh - Sx(12), c);
-                std::wstring title, aside;
-                IconId ic;
-                if (!isVideo) { ic = ICmic; title = T(L"마이크가 켜져 있어요", L"Microphone is on"); aside = AppNames(true); }
-                else if (g.stCam) { ic = ICcam; title = std::wstring(T(L"카메라 켜짐 · ", L"Camera on · ")) + AppNames(false); }
-                else { ic = ICscreenUp; title = T(L"화면·영상·파일 전송 중", L"Screen/video/file upload"); aside = FmtBytesRate(g.stUp); }
-                Icon(gr, ic, px + Sx(10), cy - Sx(7), Sx(14), c, 1.6f);
-                bool upRow = isVideo && !g.stCam;  // 전송 줄은 버튼 없음
-                if (upRow) {  // 속도 뒤에 출처. 좁으면 "외 N" → 속도 순으로 빼고 앱 이름만
-                    RectF tb; gr.MeasureString(title.c_str(), -1, &fRow, PointF(0, 0), &tb);
-                    float room = rightNoBtn - (px + Sx(30)) - tb.Width - Sx(2);
-                    aside = FitFirst(gr, fSub, room, {aside + L" · " + SourceTail(true), aside + L" · " + SourceTail(false),
-                                                      SourceTail(false)});
-                }
-                titleWithAside(y, rh, title, aside, tc, upRow ? rightNoBtn : right);
-                if (isVideo && !upRow) { bool off = CameraIsBlocked(); button(cy, off ? T(L"해제", L"On") : T(L"끄기", L"Off"), c, 10, off); }
-                else if (!isVideo) button(cy, g.micMuted == 1 ? T(L"해제", L"Unmute") : T(L"음소거", L"Mute"), c, 11, g.micMuted == 1);
+            // ── 화면·영상·파일 전송 중: 맨 위 제목 + 전체 속도, 그 아래 출처를 업로드 많은 순으로 최대 3줄(이름 · 속도).
+            //    나머지 출처는 표시하지 않음. 멈출 수단이 없으므로 버튼 없음 ──
+            bar(top + Sx(12), (float)Sx(BODYH - 24), cOrange);
+            float ty = top + Sx(10), th = (float)Sx(20);  // 제목 줄
+            Icon(gr, ICscreenUp, px + Sx(9), ty + th / 2 - Sx(9), Sx(18), cOrange, 1.5f);
+            float tx = px + Sx(36), xr = (float)(W - Sx(12));
+            std::wstring total = FmtBytesRate(g.stUp);
+            RectF tb; gr.MeasureString(total.c_str(), -1, &fRow, PointF(0, 0), &tb);
+            StringFormat sfR; sfR.SetAlignment(StringAlignmentFar); sfR.SetLineAlignment(StringAlignmentCenter);
+            sfR.SetFormatFlags(StringFormatFlagsNoWrap);
+            SolidBrush ob(cOrangeText);
+            gr.DrawString(T(L"화면·영상·파일 전송 중", L"Screen/video/file upload"), -1, &fRow,
+                          RectF(tx, ty, xr - tx - tb.Width - Sx(4), th), &sfL, &ob);
+            gr.DrawString(total.c_str(), -1, &fRow, RectF(tx, ty, xr - tx, th), &sfR, &ob);
+            std::vector<std::pair<std::wstring, double>> rows = g.srcTop;
+            if (rows.empty()) rows.push_back({L"", g.stUp});  // 앱별로 확인된 게 없으면 한 줄: 출처 불분명
+            float ry = ty + th + Sx(4), rhh = (float)Sx(16);
+            SolidBrush nb(cFg), sb(cDim);
+            for (size_t i = 0; i < rows.size() && i < 3; i++, ry += rhh) {
+                std::wstring sp = FmtBytesRate(rows[i].second);
+                RectF sbx; gr.MeasureString(sp.c_str(), -1, &fSub, PointF(0, 0), &sbx);
+                gr.DrawString(SourceLabel(rows[i].first).c_str(), -1, &fSub, RectF(tx, ry, xr - tx - sbx.Width - Sx(6), rhh), &sfL, &nb);
+                gr.DrawString(sp.c_str(), -1, &fSub, RectF(tx, ry, xr - tx, rhh), &sfR, &sb);
             }
         }
     }
@@ -883,13 +785,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             gSliding = true;
             SetCapture(h);
             SetSensFromX((float)GET_X_LPARAM(lp));
-        } else if (btn == 10) {  // 영상 끄기 = 카메라 하드웨어 차단 토글 (인터넷 무관)
-            CameraSetBlocked(!CameraIsBlocked());
-            InvalidateRect(h, nullptr, FALSE);
-        } else if (btn == 11) {  // 음성 끄기 = 시스템 마이크 음소거 토글
-            MicSetMute(g.micMuted == 1 ? FALSE : TRUE);
-            g.micMuted = MicMuteState();
-            InvalidateRect(h, nullptr, FALSE);
         } else if (!CfgGet(L"locked", 0)) {  // 드래그 이동
             gDragging = true;
             SetCapture(h);

@@ -4,7 +4,6 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <dwmapi.h>
-#include <appmodel.h>
 #include <winternl.h>
 #include <shellapi.h>
 #include <vector>
@@ -14,7 +13,6 @@
 struct ProcInfo {
     std::wstring path;   // 소문자 전체 경로 (앱 식별 키)
     DWORD session = 0;   // 0 = 서비스 세션
-    std::wstring pkg;    // UWP 패키지 패밀리명 (있을 때만)
     DWORD parent = 0;    // 부모 pid (업로드 출처를 창 있는 앱으로 묶을 때)
 };
 
@@ -30,19 +28,8 @@ inline std::wstring PathOfPid(DWORD pid) {
     CloseHandle(h);
     return r;
 }
-inline std::wstring PkgOfPid(DWORD pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return L"";
-    wchar_t buf[256];
-    UINT32 n = 256;
-    std::wstring r;
-    if (GetPackageFamilyName(h, &n, buf) == ERROR_SUCCESS) r = Lower(buf);
-    CloseHandle(h);
-    return r;
-}
-
 // 모든 프로세스의 pid -> 경로/세션 캐시 갱신 (이전 캐시 재사용)
-inline void SnapshotProcs(std::unordered_map<DWORD, ProcInfo>& procs, bool wantPkg) {
+inline void SnapshotProcs(std::unordered_map<DWORD, ProcInfo>& procs) {
     std::unordered_map<DWORD, ProcInfo> next;
     HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (s == INVALID_HANDLE_VALUE) return;
@@ -60,7 +47,6 @@ inline void SnapshotProcs(std::unordered_map<DWORD, ProcInfo>& procs, bool wantP
             if (pi.path.empty()) pi.path = Lower(pe.szExeFile);
             ProcessIdToSessionId(pid, &pi.session);
         }
-        if (wantPkg && pi.pkg.empty() && pi.session != 0) pi.pkg = PkgOfPid(pid);
         pi.parent = pe.th32ParentProcessID;
         next[pid] = pi;
     }

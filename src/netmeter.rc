@@ -3,8 +3,8 @@
 1 ICON "../assets/icon/netshutter.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,0,5,0
-PRODUCTVERSION 1,0,5,0
+FILEVERSION 1,0,6,0
+PRODUCTVERSION 1,0,6,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -12,9 +12,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "KGNF Games"
       VALUE "FileDescription", "NetShutter"
-      VALUE "FileVersion", "1.0.5.0"
+      VALUE "FileVersion", "1.0.6.0"
       VALUE "ProductName", "NetShutter"
-      VALUE "ProductVersion", "1.0.5.0"
+      VALUE "ProductVersion", "1.0.6.0"
     END
   END
   BLOCK "VarFileInfo"

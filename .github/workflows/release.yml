@@ -22,21 +22,18 @@ jobs:
           update: true
           install: mingw-w64-ucrt-x86_64-gcc
 
-      # 태그 버전(vX.Y.Z)을 netmeter.rc 버전 리소스에 넣는다. 앱 헤더·메뉴는 PRODUCTVERSION을 읽는다.
-      - name: Stamp version
+      # 저장소의 netmeter.rc 버전이 태그와 같아야 릴리스한다(release.ps1이 올림).
+      # 그래야 같은 커밋을 로컬에서 빌드해도 배포본과 버전이 같다. 앱 헤더·메뉴는 PRODUCTVERSION을 읽는다.
+      - name: Check version
         shell: pwsh
         run: |
           $tag = '${{ github.ref_name }}'
           if ($tag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') { throw "태그 형식이 vX.Y.Z가 아님: $tag" }
           $comma = "$($Matches[1]),$($Matches[2]),$($Matches[3]),0"
-          $dot   = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
           $rc = Get-Content src/netmeter.rc -Raw
-          $rc = $rc -replace 'FILEVERSION\s+[\d,]+', "FILEVERSION $comma"
-          $rc = $rc -replace 'PRODUCTVERSION\s+[\d,]+', "PRODUCTVERSION $comma"
-          $rc = $rc -replace '"FileVersion", "[^"]*"', "`"FileVersion`", `"$dot`""
-          $rc = $rc -replace '"ProductVersion", "[^"]*"', "`"ProductVersion`", `"$dot`""
-          Set-Content src/netmeter.rc $rc -NoNewline
-          Get-Content src/netmeter.rc
+          if ($rc -notmatch "PRODUCTVERSION\s+$comma") {
+            throw "src/netmeter.rc 버전이 $tag 와 다릅니다. release.ps1로 버전을 올린 커밋에 태그를 다세요."
+          }
 
       # 로컬과 같은 build.bat로 빌드한다 (옵션을 한곳에서만 관리).
       - name: Build
